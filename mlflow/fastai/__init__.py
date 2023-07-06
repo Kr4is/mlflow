@@ -15,7 +15,7 @@ fastai (native) format
 import os
 import yaml
 import tempfile
-import shutil
+from pathlib import Path
 import pandas as pd
 import numpy as np
 
@@ -33,6 +33,8 @@ from mlflow.utils.environment import (
     _CONDA_ENV_FILE_NAME,
     _REQUIREMENTS_FILE_NAME,
     _CONSTRAINTS_FILE_NAME,
+    _PYTHON_ENV_FILE_NAME,
+    _PythonEnv,
 )
 from mlflow.utils.requirements_utils import _get_pinned_requirement
 from mlflow.utils.file_utils import write_to
@@ -86,6 +88,7 @@ def save_model(
     input_example: ModelInputExample = None,
     pip_requirements=None,
     extra_pip_requirements=None,
+    metadata=None,
     **kwargs,
 ):
     """
@@ -108,9 +111,10 @@ def save_model(
 
                       .. code-block:: python
 
-                        from mlflow.models.signature import infer_signature
+                        from mlflow.models import infer_signature
+
                         train = df.drop_column("target_label")
-                        predictions = ... # compute model predictions
+                        predictions = ...  # compute model predictions
                         signature = infer_signature(train, predictions)
     :param input_example: Input example provides one or several instances of valid
                           model input. The example can be used as a hint of what data to feed the
@@ -119,6 +123,10 @@ def save_model(
                           base64-encoded.
     :param pip_requirements: {{ pip_requirements }}
     :param extra_pip_requirements: {{ extra_pip_requirements }}
+    :param metadata: Custom metadata dictionary passed to the model and stored in the MLmodel file.
+
+                     .. Note:: Experimental: This parameter may change or be removed in a future
+                                             release without warning.
 
     :param kwargs: kwargs to pass to ``Learner.save`` method.
 
@@ -135,16 +143,15 @@ def save_model(
         # Start MLflow session and save model to current working directory
         with mlflow.start_run():
             model.fit(epochs, learning_rate)
-            mlflow.fastai.save_model(model, 'model')
+            mlflow.fastai.save_model(model, "model")
 
         # Load saved model for inference
-        model_uri = "{}/{}".format(os.getcwd(), 'model')
+        model_uri = "{}/{}".format(os.getcwd(), "model")
         loaded_model = mlflow.fastai.load_model(model_uri)
         results = loaded_model.predict(predict_data)
     """
     import fastai
     from fastai.callback.all import ParamScheduler
-    from pathlib import Path
 
     _validate_env_arguments(conda_env, pip_requirements, extra_pip_requirements)
 
@@ -161,6 +168,8 @@ def save_model(
         mlflow_model.signature = signature
     if input_example is not None:
         _save_example(mlflow_model, input_example, path)
+    if metadata is not None:
+        mlflow_model.metadata = metadata
 
     # ParamScheduler currently is not pickable
     # hence it is been removed before export and added again after export
@@ -174,7 +183,8 @@ def save_model(
         loader_module="mlflow.fastai",
         data=model_data_subpath,
         code=code_dir_subpath,
-        env=_CONDA_ENV_FILE_NAME,
+        conda_env=_CONDA_ENV_FILE_NAME,
+        python_env=_PYTHON_ENV_FILE_NAME,
     )
     mlflow_model.add_flavor(
         FLAVOR_NAME,
@@ -215,6 +225,8 @@ def save_model(
     # Save `requirements.txt`
     write_to(os.path.join(path, _REQUIREMENTS_FILE_NAME), "\n".join(pip_requirements))
 
+    _PythonEnv.current().to_yaml(os.path.join(path, _PYTHON_ENV_FILE_NAME))
+
 
 @format_docstring(LOG_MODEL_PARAM_DOCS.format(package_name=FLAVOR_NAME))
 def log_model(
@@ -228,6 +240,7 @@ def log_model(
     await_registration_for=DEFAULT_AWAIT_MAX_SLEEP_SECONDS,
     pip_requirements=None,
     extra_pip_requirements=None,
+    metadata=None,
     **kwargs,
 ):
     """
@@ -253,9 +266,10 @@ def log_model(
 
                       .. code-block:: python
 
-                        from mlflow.models.signature import infer_signature
+                        from mlflow.models import infer_signature
+
                         train = df.drop_column("target_label")
-                        predictions = ... # compute model predictions
+                        predictions = ...  # compute model predictions
                         signature = infer_signature(train, predictions)
     :param input_example: Input example provides one or several instances of valid
                           model input. The example can be used as a hint of what data to feed the
@@ -269,6 +283,10 @@ def log_model(
                             waits for five minutes. Specify 0 or None to skip waiting.
     :param pip_requirements: {{ pip_requirements }}
     :param extra_pip_requirements: {{ extra_pip_requirements }}
+    :param metadata: Custom metadata dictionary passed to the model and stored in the MLmodel file.
+
+                     .. Note:: Experimental: This parameter may change or be removed in a future
+                                             release without warning.
     :return: A :py:class:`ModelInfo <mlflow.models.model.ModelInfo>` instance that contains the
              metadata of the logged model.
 
@@ -277,27 +295,33 @@ def log_model(
 
         import fastai.vision as vis
         import mlflow.fastai
-        from mlflow.tracking import MlflowClient
+        from mlflow import MlflowClient
+
 
         def main(epochs=5, learning_rate=0.01):
             # Download and untar the MNIST data set
             path = vis.untar_data(vis.URLs.MNIST_SAMPLE)
 
-           # Prepare, transform, and normalize the data
-           data = vis.ImageDataBunch.from_folder(path, ds_tfms=(vis.rand_pad(2, 28), []), bs=64)
-           data.normalize(vis.imagenet_stats)
+            # Prepare, transform, and normalize the data
+            data = vis.ImageDataBunch.from_folder(
+                path, ds_tfms=(vis.rand_pad(2, 28), []), bs=64
+            )
+            data.normalize(vis.imagenet_stats)
 
-           # Create the CNN Learner model
-           model = vis.cnn_learner(data, vis.models.resnet18, metrics=vis.accuracy)
+            # Create the CNN Learner model
+            model = vis.cnn_learner(data, vis.models.resnet18, metrics=vis.accuracy)
 
-           # Start MLflow session and log model
-           with mlflow.start_run() as run:
+            # Start MLflow session and log model
+            with mlflow.start_run() as run:
                 model.fit(epochs, learning_rate)
-                mlflow.fastai.log_model(model, 'model')
+                mlflow.fastai.log_model(model, "model")
 
-           # fetch the logged model artifacts
-           artifacts = [f.path for f in MlflowClient().list_artifacts(run.info.run_id, 'model')]
-           print("artifacts: {}".format(artifacts))
+            # fetch the logged model artifacts
+            artifacts = [
+                f.path for f in MlflowClient().list_artifacts(run.info.run_id, "model")
+            ]
+            print("artifacts: {}".format(artifacts))
+
 
         main()
 
@@ -318,6 +342,7 @@ def log_model(
         await_registration_for=await_registration_for,
         pip_requirements=pip_requirements,
         extra_pip_requirements=extra_pip_requirements,
+        metadata=metadata,
         **kwargs,
     )
 
@@ -396,6 +421,7 @@ def load_model(model_uri, dst_path=None):
 @autologging_integration(FLAVOR_NAME)
 def autolog(
     log_models=True,
+    log_datasets=True,
     disable=False,
     exclusive=False,
     disable_for_unsupported_versions=False,
@@ -414,6 +440,8 @@ def autolog(
 
     :param log_models: If ``True``, trained models are logged as MLflow model artifacts.
                        If ``False``, trained models are not logged.
+    :param log_datasets: If ``True``, dataset information is logged to MLflow Tracking.
+                         If ``False``, dataset information is not logged.
     :param disable: If ``True``, disables the Fastai autologging integration. If ``False``,
                     enables the Fastai autologging integration.
     :param exclusive: If ``True``, autologged content is not logged to user-created fluent runs.
@@ -434,11 +462,12 @@ def autolog(
 
         # This is a modified example from
         # https://github.com/mlflow/mlflow/tree/master/examples/fastai
-        # demonstrating autolog capabilites.
+        # demonstrating autolog capabilities.
 
         import fastai.vision as vis
         import mlflow.fastai
-        from mlflow.tracking import MlflowClient
+        from mlflow import MlflowClient
+
 
         def print_auto_logged_info(r):
             tags = {k: v for k, v in r.data.tags.items() if not k.startswith("mlflow.")}
@@ -449,12 +478,15 @@ def autolog(
             print("metrics: {}".format(r.data.metrics))
             print("tags: {}".format(tags))
 
+
         def main(epochs=5, learning_rate=0.01):
             # Download and untar the MNIST data set
             path = vis.untar_data(vis.URLs.MNIST_SAMPLE)
 
             # Prepare, transform, and normalize the data
-            data = vis.ImageDataBunch.from_folder(path, ds_tfms=(vis.rand_pad(2, 28), []), bs=64)
+            data = vis.ImageDataBunch.from_folder(
+                path, ds_tfms=(vis.rand_pad(2, 28), []), bs=64
+            )
             data.normalize(vis.imagenet_stats)
 
             # Create CNN the Learner model
@@ -469,6 +501,7 @@ def autolog(
 
             # fetch the auto logged parameters, metrics, and artifacts
             print_auto_logged_info(mlflow.get_run(run_id=run.info.run_id))
+
 
         main()
 
@@ -524,11 +557,11 @@ def autolog(
                     "early_stop_comp": callback.comp.__name__,
                 }
                 mlflow.log_params(earlystopping_params)
-            except Exception:  # pylint: disable=W0703
+            except Exception:
                 return
 
     def _log_model_info(learner):
-        # The process excuted here, are incompatible with TrackerCallback
+        # The process executed here, are incompatible with TrackerCallback
         # Hence it is removed and add again after the execution
         remove_cbs = [cb for cb in learner.cbs if isinstance(cb, TrackerCallback)]
         if remove_cbs:
@@ -537,7 +570,7 @@ def autolog(
         xb = learner.dls.train.one_batch()[: learner.dls.train.n_inp]
         infos = layer_info(learner, *xb)
         bs = find_bs(xb)
-        inp_sz = _print_shapes(map(lambda x: x.shape, xb), bs)
+        inp_sz = _print_shapes((x.shape for x in xb), bs)
         mlflow.log_param("input_size", inp_sz)
         mlflow.log_param("num_layers", len(infos))
 
@@ -547,14 +580,11 @@ def autolog(
         if remove_cbs:
             learner.add_cbs(remove_cbs)
 
-        tempdir = tempfile.mkdtemp()
-        try:
+        with tempfile.TemporaryDirectory() as tempdir:
             summary_file = os.path.join(tempdir, "module_summary.txt")
             with open(summary_file, "w") as f:
                 f.write(summary)
             mlflow.log_artifact(local_path=summary_file)
-        finally:
-            shutil.rmtree(tempdir)
 
     def _run_and_log_function(self, original, args, kwargs, unlogged_params, is_fine_tune=False):
         # Check if is trying to fit while fine tuning or not
@@ -568,7 +598,6 @@ def autolog(
 
         run_id = mlflow.active_run().info.run_id
         with batch_metrics_logger(run_id) as metrics_logger:
-
             if not fit_in_fine_tune:
                 early_stop_callback = _find_callback_of_type(EarlyStoppingCallback, self.cbs)
                 _log_early_stop_callback_params(early_stop_callback)

@@ -6,7 +6,6 @@ will use to supplement our input and train using.
 import click
 
 import mlflow
-import mlflow.keras
 import mlflow.spark
 
 from itertools import chain
@@ -43,7 +42,7 @@ def train_keras(ratings_data, als_model_uri, hidden_units):
     mlflow.log_metric("training_nrows", training_df.count())
     mlflow.log_metric("test_nrows", test_df.count())
 
-    print("Training: {0}, test: {1}".format(training_df.count(), test_df.count()))
+    print("Training: {}, test: {}".format(training_df.count(), test_df.count()))
 
     user_factors = als_model.userFactors.selectExpr("id as userId", "features as uFeatures")
     item_factors = als_model.itemFactors.selectExpr("id as movieId", "features as iFeatures")
@@ -109,8 +108,8 @@ def train_keras(ratings_data, als_model_uri, hidden_units):
     mlflow.log_metric("test_mse", test_mse)
     mlflow.log_metric("train_mse", train_mse)
 
-    print("The model had a MSE on the test set of {0}".format(test_mse))
-    mlflow.keras.log_model(model, "keras-model")
+    print("The model had a MSE on the test set of {}".format(test_mse))
+    mlflow.tensorflow.log_model(model, "keras-model")
 
 
 if __name__ == "__main__":

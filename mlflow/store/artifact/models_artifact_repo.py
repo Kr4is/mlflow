@@ -11,6 +11,10 @@ from mlflow.store.artifact.utils.models import (
 from mlflow.utils.uri import (
     add_databricks_profile_info_to_artifact_uri,
     get_databricks_profile_uri_from_artifact_uri,
+    is_databricks_unity_catalog_uri,
+)
+from mlflow.store.artifact.unity_catalog_models_artifact_repo import (
+    UnityCatalogModelsArtifactRepository,
 )
 
 
@@ -28,7 +32,12 @@ class ModelsArtifactRepository(ArtifactRepository):
         from mlflow.store.artifact.artifact_repository_registry import get_artifact_repository
 
         super().__init__(artifact_uri)
-        if is_using_databricks_registry(artifact_uri):
+        registry_uri = mlflow.get_registry_uri()
+        if is_databricks_unity_catalog_uri(uri=registry_uri):
+            self.repo = UnityCatalogModelsArtifactRepository(
+                artifact_uri=artifact_uri, registry_uri=registry_uri
+            )
+        elif is_using_databricks_registry(artifact_uri):
             # Use the DatabricksModelsArtifactRepository if a databricks profile is being used.
             self.repo = DatabricksModelsArtifactRepository(artifact_uri)
         else:
@@ -42,10 +51,25 @@ class ModelsArtifactRepository(ArtifactRepository):
         return urllib.parse.urlparse(uri).scheme == "models"
 
     @staticmethod
+    def split_models_uri(uri):
+        """
+        Split 'models:/<name>/<version>/path/to/model' into
+        ('models:/<name>/<version>', 'path/to/model').
+        """
+        path = urllib.parse.urlparse(uri).path
+        if path.count("/") >= 3 and not path.endswith("/"):
+            splits = path.split("/", 3)
+            model_name_and_version = splits[:3]
+            artifact_path = splits[-1]
+            return "models:" + "/".join(model_name_and_version), artifact_path
+        return uri, ""
+
+    @staticmethod
     def get_underlying_uri(uri):
         # Note: to support a registry URI that is different from the tracking URI here,
         # we'll need to add setting of registry URIs via environment variables.
-        from mlflow.tracking import MlflowClient
+
+        from mlflow import MlflowClient
 
         databricks_profile_uri = (
             get_databricks_profile_uri_from_artifact_uri(uri) or mlflow.get_registry_uri()

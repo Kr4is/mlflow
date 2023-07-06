@@ -1,22 +1,23 @@
 import collections
-from packaging.version import Version
 import inspect
 import logging
-from numbers import Number
 import numpy as np
-import time
 import warnings
+import pkgutil
+import platform
+from copy import deepcopy
+from numbers import Number
+from importlib import import_module
+from operator import itemgetter
+from packaging.version import Version
 
-from mlflow.tracking.client import MlflowClient
+from mlflow import MlflowClient
 from mlflow.utils.file_utils import TempDir
 from mlflow.utils.mlflow_tags import MLFLOW_PARENT_RUN_ID
 from mlflow.utils.arguments_utils import _get_arg_names
+from mlflow.utils.time_utils import get_current_time_millis
 
 _logger = logging.getLogger(__name__)
-
-# The earliest version we're guaranteed to support. Autologging utilities may not work properly
-# on scikit-learn older than this version.
-_MIN_SKLEARN_VERSION = "0.20.3"
 
 # The prefix to note that all calculated metrics and artifacts are solely based on training datasets
 _TRAINING_PREFIX = "training_"
@@ -92,7 +93,8 @@ def _get_X_y_and_sample_weight(fit_func, fit_args, fit_kwargs):
 
     :returns: A tuple of either (X, y, sample_weight), where `y` and `sample_weight` may be
               `None` if the specified `fit_args` and `fit_kwargs` do not specify labels or
-              a sample weighting.
+              a sample weighting. Copies of `X` and `y` are made in order to avoid mutation
+              of the dataset during training.
     """
 
     def _get_Xy(args, kwargs, X_var_name, y_var_name):
@@ -125,14 +127,18 @@ def _get_X_y_and_sample_weight(fit_func, fit_args, fit_kwargs):
     # However, certain sklearn models use different variable names for X and y.
     # E.g., see: https://scikit-learn.org/stable/modules/generated/sklearn.multioutput.MultiOutputClassifier.html#sklearn.multioutput.MultiOutputClassifier.fit
     X_var_name, y_var_name = fit_arg_names[:2]
-    Xy = _get_Xy(fit_args, fit_kwargs, X_var_name, y_var_name)
+    X, y = _get_Xy(fit_args, fit_kwargs, X_var_name, y_var_name)
+    if X is not None:
+        X = deepcopy(X)
+    if y is not None:
+        y = deepcopy(y)
     sample_weight = (
         _get_sample_weight(fit_arg_names, fit_args, fit_kwargs)
         if (_SAMPLE_WEIGHT in fit_arg_names)
         else None
     )
 
-    return (*Xy, sample_weight)
+    return (X, y, sample_weight)
 
 
 def _get_metrics_value_dict(metrics_list):
@@ -147,7 +153,7 @@ def _get_metrics_value_dict(metrics_list):
     return metric_value_dict
 
 
-def _get_classifier_metrics(fitted_estimator, prefix, X, y_true, sample_weight):
+def _get_classifier_metrics(fitted_estimator, prefix, X, y_true, sample_weight, pos_label):
     """
     Compute and record various common metrics for classifiers
 
@@ -157,8 +163,9 @@ def _get_classifier_metrics(fitted_estimator, prefix, X, y_true, sample_weight):
     https://scikit-learn.org/stable/modules/generated/sklearn.metrics.recall_score.html
     (3) f1_score:
     https://scikit-learn.org/stable/modules/generated/sklearn.metrics.f1_score.html
-    By default, we choose the parameter `labels` to be `None`, `pos_label` to be `1`,
-    `average` to be `weighted` to compute the weighted precision score.
+    By default, when `pos_label` is not specified (passed in as `None`), we set `average`
+    to `weighted` to compute the weighted score of these metrics.
+    When the `pos_label` is specified (not `None`), we set `average` to `binary`.
 
     For (4) accuracy score:
     https://scikit-learn.org/stable/modules/generated/sklearn.metrics.accuracy_score.html
@@ -187,36 +194,52 @@ def _get_classifier_metrics(fitted_estimator, prefix, X, y_true, sample_weight):
     """
     import sklearn
 
+    average = "weighted" if pos_label is None else "binary"
     y_pred = fitted_estimator.predict(X)
 
     classifier_metrics = [
         _SklearnMetric(
             name=prefix + "precision_score",
             function=sklearn.metrics.precision_score,
-            arguments=dict(
-                y_true=y_true, y_pred=y_pred, average="weighted", sample_weight=sample_weight
-            ),
+            arguments={
+                "y_true": y_true,
+                "y_pred": y_pred,
+                "pos_label": pos_label,
+                "average": average,
+                "sample_weight": sample_weight,
+            },
         ),
         _SklearnMetric(
             name=prefix + "recall_score",
             function=sklearn.metrics.recall_score,
-            arguments=dict(
-                y_true=y_true, y_pred=y_pred, average="weighted", sample_weight=sample_weight
-            ),
+            arguments={
+                "y_true": y_true,
+                "y_pred": y_pred,
+                "pos_label": pos_label,
+                "average": average,
+                "sample_weight": sample_weight,
+            },
         ),
         _SklearnMetric(
             name=prefix + "f1_score",
             function=sklearn.metrics.f1_score,
-            arguments=dict(
-                y_true=y_true, y_pred=y_pred, average="weighted", sample_weight=sample_weight
-            ),
+            arguments={
+                "y_true": y_true,
+                "y_pred": y_pred,
+                "pos_label": pos_label,
+                "average": average,
+                "sample_weight": sample_weight,
+            },
         ),
         _SklearnMetric(
             name=prefix + "accuracy_score",
             function=sklearn.metrics.accuracy_score,
-            arguments=dict(
-                y_true=y_true, y_pred=y_pred, normalize=True, sample_weight=sample_weight
-            ),
+            arguments={
+                "y_true": y_true,
+                "y_pred": y_pred,
+                "normalize": True,
+                "sample_weight": sample_weight,
+            },
         ),
     ]
 
@@ -227,7 +250,11 @@ def _get_classifier_metrics(fitted_estimator, prefix, X, y_true, sample_weight):
                 _SklearnMetric(
                     name=prefix + "log_loss",
                     function=sklearn.metrics.log_loss,
-                    arguments=dict(y_true=y_true, y_pred=y_pred_proba, sample_weight=sample_weight),
+                    arguments={
+                        "y_true": y_true,
+                        "y_pred": y_pred_proba,
+                        "sample_weight": sample_weight,
+                    },
                 ),
             ]
         )
@@ -241,15 +268,15 @@ def _get_classifier_metrics(fitted_estimator, prefix, X, y_true, sample_weight):
             classifier_metrics.extend(
                 [
                     _SklearnMetric(
-                        name=prefix + "roc_auc_score",
+                        name=prefix + "roc_auc",
                         function=sklearn.metrics.roc_auc_score,
-                        arguments=dict(
-                            y_true=y_true,
-                            y_score=y_pred_proba,
-                            average="weighted",
-                            sample_weight=sample_weight,
-                            multi_class="ovo",
-                        ),
+                        arguments={
+                            "y_true": y_true,
+                            "y_score": y_pred_proba,
+                            "average": "weighted",
+                            "sample_weight": sample_weight,
+                            "multi_class": "ovo",
+                        },
                     ),
                 ]
             )
@@ -295,8 +322,11 @@ def _get_classifier_artifacts(fitted_estimator, prefix, X, y_true, sample_weight
     if not _is_plotting_supported():
         return []
 
+    is_plot_function_deprecated = Version(sklearn.__version__) >= Version("1.0")
+
     def plot_confusion_matrix(*args, **kwargs):
         import matplotlib
+        import matplotlib.pyplot as plt
 
         class_labels = _get_class_labels_from_estimator(fitted_estimator)
         if class_labels is None:
@@ -304,14 +334,19 @@ def _get_classifier_artifacts(fitted_estimator, prefix, X, y_true, sample_weight
 
         with matplotlib.rc_context(
             {
-                "figure.dpi": 288,
-                "figure.figsize": [6.0, 4.0],
-                "font.size": min(10.0, 50.0 / len(class_labels)),
-                "axes.labelsize": 10.0,
+                "font.size": min(8.0, 50.0 / len(class_labels)),
+                "axes.labelsize": 8.0,
+                "figure.dpi": 175,
             }
         ):
-            return sklearn.metrics.plot_confusion_matrix(*args, **kwargs)
+            _, ax = plt.subplots(1, 1, figsize=(6.0, 4.0))
+            return (
+                sklearn.metrics.ConfusionMatrixDisplay.from_estimator(*args, **kwargs, ax=ax)
+                if is_plot_function_deprecated
+                else sklearn.metrics.plot_confusion_matrix(*args, **kwargs, ax=ax)
+            )
 
+    y_true_arg_name = "y" if is_plot_function_deprecated else "y_true"
     classifier_artifacts = [
         _SklearnArtifact(
             name=prefix + "confusion_matrix",
@@ -319,10 +354,10 @@ def _get_classifier_artifacts(fitted_estimator, prefix, X, y_true, sample_weight
             arguments=dict(
                 estimator=fitted_estimator,
                 X=X,
-                y_true=y_true,
                 sample_weight=sample_weight,
                 normalize="true",
                 cmap="Blues",
+                **{y_true_arg_name: y_true},
             ),
             title="Normalized confusion matrix",
         ),
@@ -335,24 +370,28 @@ def _get_classifier_artifacts(fitted_estimator, prefix, X, y_true, sample_weight
             [
                 _SklearnArtifact(
                     name=prefix + "roc_curve",
-                    function=sklearn.metrics.plot_roc_curve,
-                    arguments=dict(
-                        estimator=fitted_estimator,
-                        X=X,
-                        y=y_true,
-                        sample_weight=sample_weight,
-                    ),
+                    function=sklearn.metrics.RocCurveDisplay.from_estimator
+                    if is_plot_function_deprecated
+                    else sklearn.metrics.plot_roc_curve,
+                    arguments={
+                        "estimator": fitted_estimator,
+                        "X": X,
+                        "y": y_true,
+                        "sample_weight": sample_weight,
+                    },
                     title="ROC curve",
                 ),
                 _SklearnArtifact(
                     name=prefix + "precision_recall_curve",
-                    function=sklearn.metrics.plot_precision_recall_curve,
-                    arguments=dict(
-                        estimator=fitted_estimator,
-                        X=X,
-                        y=y_true,
-                        sample_weight=sample_weight,
-                    ),
+                    function=sklearn.metrics.PrecisionRecallDisplay.from_estimator
+                    if is_plot_function_deprecated
+                    else sklearn.metrics.plot_precision_recall_curve,
+                    arguments={
+                        "estimator": fitted_estimator,
+                        "X": X,
+                        "y": y_true,
+                        "sample_weight": sample_weight,
+                    },
                     title="Precision recall curve",
                 ),
             ]
@@ -392,34 +431,34 @@ def _get_regressor_metrics(fitted_estimator, prefix, X, y_true, sample_weight):
 
     regressor_metrics = [
         _SklearnMetric(
-            name=prefix + "mse",
+            name=prefix + "mean_squared_error",
             function=sklearn.metrics.mean_squared_error,
-            arguments=dict(
-                y_true=y_true,
-                y_pred=y_pred,
-                sample_weight=sample_weight,
-                multioutput="uniform_average",
-            ),
+            arguments={
+                "y_true": y_true,
+                "y_pred": y_pred,
+                "sample_weight": sample_weight,
+                "multioutput": "uniform_average",
+            },
         ),
         _SklearnMetric(
-            name=prefix + "mae",
+            name=prefix + "mean_absolute_error",
             function=sklearn.metrics.mean_absolute_error,
-            arguments=dict(
-                y_true=y_true,
-                y_pred=y_pred,
-                sample_weight=sample_weight,
-                multioutput="uniform_average",
-            ),
+            arguments={
+                "y_true": y_true,
+                "y_pred": y_pred,
+                "sample_weight": sample_weight,
+                "multioutput": "uniform_average",
+            },
         ),
         _SklearnMetric(
             name=prefix + "r2_score",
             function=sklearn.metrics.r2_score,
-            arguments=dict(
-                y_true=y_true,
-                y_pred=y_pred,
-                sample_weight=sample_weight,
-                multioutput="uniform_average",
-            ),
+            arguments={
+                "y_true": y_true,
+                "y_pred": y_pred,
+                "sample_weight": sample_weight,
+                "multioutput": "uniform_average",
+            },
         ),
     ]
 
@@ -427,7 +466,9 @@ def _get_regressor_metrics(fitted_estimator, prefix, X, y_true, sample_weight):
     # `sklearn.metrics.mean_squared_error` does not have "squared" parameter to calculate `rmse`,
     # we compute it through np.sqrt(<value of mse>)
     metrics_value_dict = _get_metrics_value_dict(regressor_metrics)
-    metrics_value_dict[prefix + "rmse"] = np.sqrt(metrics_value_dict[prefix + "mse"])
+    metrics_value_dict[prefix + "root_mean_squared_error"] = np.sqrt(
+        metrics_value_dict[prefix + "mean_squared_error"]
+    )
 
     return metrics_value_dict
 
@@ -457,17 +498,17 @@ def _log_warning_for_artifacts(func_name, func_call, err):
 
 
 def _log_specialized_estimator_content(
-    autologging_client, fitted_estimator, run_id, prefix, X, y_true=None, sample_weight=None
+    autologging_client, fitted_estimator, run_id, prefix, X, y_true, sample_weight, pos_label
 ):
     import sklearn
 
-    metrics = dict()
+    metrics = {}
 
     if y_true is not None:
         try:
             if sklearn.base.is_classifier(fitted_estimator):
                 metrics = _get_classifier_metrics(
-                    fitted_estimator, prefix, X, y_true, sample_weight
+                    fitted_estimator, prefix, X, y_true, sample_weight, pos_label
                 )
             elif sklearn.base.is_regressor(fitted_estimator):
                 metrics = _get_regressor_metrics(fitted_estimator, prefix, X, y_true, sample_weight)
@@ -495,19 +536,28 @@ def _log_specialized_estimator_content(
                 + str(e)
             )
             _logger.warning(msg)
-            return
+            return metrics
 
+        try:
+            import matplotlib
+            import matplotlib.pyplot as plt
+        except ImportError as ie:
+            _logger.warning(
+                f"Failed to import matplotlib (error: {ie!r}). Skipping artifact logging."
+            )
+            return metrics
+
+        _matplotlib_config = {"savefig.dpi": 175, "figure.autolayout": True, "font.size": 8}
         with TempDir() as tmp_dir:
             for artifact in artifacts:
                 try:
-                    display = artifact.function(**artifact.arguments)
-                    display.ax_.set_title(artifact.title)
-                    artifact_path = "{}.png".format(artifact.name)
-                    filepath = tmp_dir.path(artifact_path)
-                    display.figure_.savefig(filepath)
-                    import matplotlib.pyplot as plt
-
-                    plt.close(display.figure_)
+                    with matplotlib.rc_context(_matplotlib_config):
+                        display = artifact.function(**artifact.arguments)
+                        display.ax_.set_title(artifact.title)
+                        artifact_path = f"{artifact.name}.png"
+                        filepath = tmp_dir.path(artifact_path)
+                        display.figure_.savefig(fname=filepath, format="png")
+                        plt.close(display.figure_)
                 except Exception as e:
                     _log_warning_for_artifacts(artifact.name, artifact.function, e)
 
@@ -516,8 +566,43 @@ def _log_specialized_estimator_content(
     return metrics
 
 
+def _is_estimator_html_repr_supported():
+    import sklearn
+
+    # Only scikit-learn >= 0.23 supports `estimator_html_repr`
+    return Version(sklearn.__version__) >= Version("0.23.0")
+
+
+def _log_estimator_html(run_id, estimator):
+    if not _is_estimator_html_repr_supported():
+        return
+
+    from sklearn.utils import estimator_html_repr
+
+    # Specifies charset so triangle toggle buttons are not garbled
+    estimator_html_string = f"""
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8"/>
+  </head>
+  <body>
+    {estimator_html_repr(estimator)}
+  </body>
+</html>
+    """
+    MlflowClient().log_text(run_id, estimator_html_string, artifact_file="estimator.html")
+
+
 def _log_estimator_content(
-    autologging_client, estimator, run_id, prefix, X, y_true=None, sample_weight=None
+    autologging_client,
+    estimator,
+    run_id,
+    prefix,
+    X,
+    y_true=None,
+    sample_weight=None,
+    pos_label=None,
 ):
     """
     Logs content for the given estimator, which includes metrics and artifacts that might be
@@ -533,6 +618,10 @@ def _log_estimator_content(
     :param X: The data samples.
     :param y_true: Labels.
     :param sample_weight: Per-sample weights used in the computation of metrics and artifacts.
+    :param pos_label: The positive label used to compute binary classification metrics such as
+        precision, recall, f1, etc. This parameter is only used for classification metrics.
+        If set to `None`, the function will calculate metrics for each label and find their
+        average weighted by support (number of true instances for each label).
     :return: A dict of the computed metrics.
     """
     metrics = _log_specialized_estimator_content(
@@ -543,6 +632,7 @@ def _log_estimator_content(
         X=X,
         y_true=y_true,
         sample_weight=sample_weight,
+        pos_label=pos_label,
     )
 
     if hasattr(estimator, "score") and y_true is not None:
@@ -564,7 +654,7 @@ def _log_estimator_content(
             score_key = prefix + "score"
             autologging_client.log_metrics(run_id=run_id, metrics={score_key: score})
             metrics[score_key] = score
-
+    _log_estimator_html(run_id, estimator)
     return metrics
 
 
@@ -629,7 +719,7 @@ def _log_child_runs_info(max_tuning_runs, total_runs):
     elif max_tuning_runs == 1:
         logging_phrase = "the best run"
     else:
-        logging_phrase = "the {} best runs".format(max_tuning_runs)
+        logging_phrase = f"the {max_tuning_runs} best runs"
 
     # Set logging statement for runs to be omitted.
     if rest <= 0:
@@ -637,7 +727,7 @@ def _log_child_runs_info(max_tuning_runs, total_runs):
     elif rest == 1:
         omitting_phrase = "one run"
     else:
-        omitting_phrase = "{} runs".format(rest)
+        omitting_phrase = f"{rest} runs"
 
     _logger.info("Logging %s, %s will be omitted.", logging_phrase, omitting_phrase)
 
@@ -674,7 +764,7 @@ def _create_child_runs_for_parameter_search(
     # start time of child runs, since we cannot precisely determine when each point
     # in the parameter search space was explored
     child_run_start_time = parent_run.info.start_time
-    child_run_end_time = int(time.time() * 1000)
+    child_run_end_time = get_current_time_millis()
 
     seed_estimator = cv_estimator.estimator
     # In the unlikely case that a seed of a parameter search estimator is,
@@ -696,12 +786,9 @@ def _create_child_runs_for_parameter_search(
         if rank_column_name not in cv_results_df.columns.values:
             rank_column_name = first_custom_rank_column(cv_results_df)
             warnings.warn(
-                "Top {} child runs will be created based on ordering in {} column.".format(
-                    max_tuning_runs,
-                    rank_column_name,
-                )
-                + " You can choose not to limit the number of child runs created by"
-                + " setting `max_tuning_runs=None`."
+                f"Top {max_tuning_runs} child runs will be created based on ordering in "
+                f"{rank_column_name} column.  You can choose not to limit the number of "
+                "child runs created by setting `max_tuning_runs=None`."
             )
         cv_results_best_n_df = cv_results_df.nsmallest(max_tuning_runs, rank_column_name)
         # Log how many child runs will be created vs omitted.
@@ -732,7 +819,7 @@ def _create_child_runs_for_parameter_search(
         excluded_metric_prefixes = ["param", "split"]
         metrics_to_log = {
             key: value
-            for key, value in result_row.iteritems()
+            for key, value in result_row.items()
             if not any(key.startswith(prefix) for prefix in excluded_metric_prefixes)
             and isinstance(value, Number)
         }
@@ -742,12 +829,6 @@ def _create_child_runs_for_parameter_search(
         )
 
         autologging_client.set_terminated(run_id=pending_child_run_id, end_time=child_run_end_time)
-
-
-def _is_supported_version():
-    import sklearn
-
-    return Version(sklearn.__version__) >= Version(_MIN_SKLEARN_VERSION)
 
 
 # Util function to check whether a metric is able to be computed in given sklearn version
@@ -806,14 +887,10 @@ def _backported_all_estimators(type_filter=None):
     -------
     estimators : list of tuples
         List of (name, class), where ``name`` is the class name as string
-        and ``class`` is the actuall type of the class.
+        and ``class`` is the actual type of the class.
     """
     # lazy import to avoid circular imports from sklearn.base
-    import pkgutil
-    import platform
     import sklearn
-    from importlib import import_module
-    from operator import itemgetter
 
     # pylint: disable=no-name-in-module, import-error
     from sklearn.utils.testing import ignore_warnings
@@ -828,7 +905,7 @@ def _backported_all_estimators(type_filter=None):
     IS_PYPY = platform.python_implementation() == "PyPy"
 
     def is_abstract(c):
-        if not (hasattr(c, "__abstractmethods__")):
+        if not hasattr(c, "__abstractmethods__"):
             return False
         if not len(c.__abstractmethods__):
             return False

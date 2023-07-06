@@ -9,6 +9,12 @@ from mlflow.exceptions import MlflowException
 from mlflow.store.artifact.artifact_repo import ArtifactRepository
 from mlflow.utils.file_utils import mkdir, relative_path_to_artifact_path
 
+from mlflow.environment_variables import (
+    MLFLOW_KERBEROS_TICKET_CACHE,
+    MLFLOW_KERBEROS_USER,
+    MLFLOW_PYARROW_EXTRA_CONF,
+)
+
 
 class HdfsArtifactRepository(ArtifactRepository):
     """
@@ -33,8 +39,8 @@ class HdfsArtifactRepository(ArtifactRepository):
         with hdfs_system(scheme=self.scheme, host=self.host, port=self.port) as hdfs:
             _, file_name = os.path.split(local_file)
             destination = posixpath.join(hdfs_base_path, file_name)
-            with hdfs.open(destination, "wb") as output:
-                output.write(open(local_file, "rb").read())
+            with open(local_file, "rb") as f:
+                hdfs.upload(destination, f)
 
     def log_artifacts(self, local_dir, artifact_path=None):
         """
@@ -46,12 +52,10 @@ class HdfsArtifactRepository(ArtifactRepository):
         hdfs_base_path = _resolve_base_path(self.path, artifact_path)
 
         with hdfs_system(scheme=self.scheme, host=self.host, port=self.port) as hdfs:
-
             if not hdfs.exists(hdfs_base_path):
                 hdfs.mkdir(hdfs_base_path)
 
             for subdir_path, _, files in os.walk(local_dir):
-
                 relative_path = _relative_path_local(local_dir, subdir_path)
 
                 hdfs_subdir_path = (
@@ -66,8 +70,8 @@ class HdfsArtifactRepository(ArtifactRepository):
                 for each_file in files:
                     source = os.path.join(subdir_path, each_file)
                     destination = posixpath.join(hdfs_subdir_path, each_file)
-                    with hdfs.open(destination, "wb") as output_stream:
-                        output_stream.write(open(source, "rb").read())
+                    with open(source, "rb") as f:
+                        hdfs.upload(destination, f)
 
     def list_artifacts(self, path=None):
         """
@@ -85,12 +89,17 @@ class HdfsArtifactRepository(ArtifactRepository):
             if hdfs.exists(hdfs_base_path):
                 for file_detail in hdfs.ls(hdfs_base_path, detail=True):
                     file_name = file_detail.get("name")
+
+                    # file_name is hdfs_base_path and not a child of that path
+                    if file_name == hdfs_base_path:
+                        continue
+
                     # Strip off anything that comes before the artifact root e.g. hdfs://name
                     offset = file_name.index(self.path)
                     rel_path = _relative_path_remote(self.path, file_name[offset:])
                     is_dir = file_detail.get("kind") == "directory"
                     size = file_detail.get("size")
-                    paths.append(FileInfo(rel_path, is_dir, size))
+                    paths.append(FileInfo(rel_path, is_dir=is_dir, file_size=size))
             return sorted(paths, key=lambda f: paths)
 
     def _walk_path(self, hdfs, hdfs_path):
@@ -131,14 +140,12 @@ class HdfsArtifactRepository(ArtifactRepository):
             local_dir = _tmp_dir(dst_path)
 
         with hdfs_system(scheme=self.scheme, host=self.host, port=self.port) as hdfs:
-
             if not hdfs.isdir(hdfs_base_path):
                 local_path = os.path.join(local_dir, os.path.normpath(artifact_path))
                 _download_hdfs_file(hdfs, hdfs_base_path, local_path)
                 return local_path
 
             for path, is_dir, _ in self._walk_path(hdfs, hdfs_base_path):
-
                 relative_path = _relative_path_remote(hdfs_base_path, path)
                 local_path = os.path.join(local_dir, relative_path) if relative_path else local_dir
 
@@ -169,9 +176,9 @@ def hdfs_system(scheme, host, port):
     """
     import pyarrow as pa
 
-    kerb_ticket = os.getenv("MLFLOW_KERBEROS_TICKET_CACHE")
-    kerberos_user = os.getenv("MLFLOW_KERBEROS_USER")
-    extra_conf = _parse_extra_conf(os.getenv("MLFLOW_PYARROW_EXTRA_CONF"))
+    kerb_ticket = MLFLOW_KERBEROS_TICKET_CACHE.get()
+    kerberos_user = MLFLOW_KERBEROS_USER.get()
+    extra_conf = _parse_extra_conf(MLFLOW_PYARROW_EXTRA_CONF.get())
 
     if host:
         host = scheme + "://" + host

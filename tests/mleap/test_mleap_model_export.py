@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 from unittest import mock
 from packaging.version import Version
 
@@ -43,18 +44,20 @@ def get_mleap_jars():
     )
 
 
-@pytest.fixture(scope="module", autouse=True)
+@pytest.fixture(scope="module")
 def spark_context():
     conf = pyspark.SparkConf()
     conf.set(key="spark.jars.packages", value=get_mleap_jars())
     # Exclude `net.sourceforge.f2j` to avoid `java.io.FileNotFoundException`
     conf.set(key="spark.jars.excludes", value="net.sourceforge.f2j:arpack_combined_all")
-    spark_session = get_spark_session(conf)
-    yield spark_session.sparkContext
-    spark_session.stop()
+    with get_spark_session(conf) as spark_session:
+        yield spark_session.sparkContext
 
 
-@pytest.mark.large
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="Docker image resolution for non-linux tests is not supported",
+)
 def test_model_deployment(spark_model_iris, model_path, spark_custom_env):
     mlflow.spark.save_model(
         spark_model_iris.model,
@@ -65,16 +68,21 @@ def test_model_deployment(spark_model_iris, model_path, spark_custom_env):
 
     scoring_response = score_model_in_sagemaker_docker_container(
         model_uri=model_path,
-        data=spark_model_iris.pandas_df.to_json(orient="split"),
+        data=json.dumps(
+            {
+                "dataframe_split": spark_model_iris.pandas_df.to_dict(orient="split"),
+            }
+        ),
         content_type=mlflow.pyfunc.scoring_server.CONTENT_TYPE_JSON,
         flavor=mlflow.mleap.FLAVOR_NAME,
     )
     np.testing.assert_array_almost_equal(
-        spark_model_iris.predictions, np.array(json.loads(scoring_response.content)), decimal=4
+        spark_model_iris.predictions,
+        np.array(json.loads(scoring_response.content)["predictions"]),
+        decimal=4,
     )
 
 
-@pytest.mark.large
 def test_mleap_module_model_save_with_relative_path_and_valid_sample_input_produces_mleap_flavor(
     spark_model_iris,
 ):
@@ -95,7 +103,6 @@ def test_mleap_module_model_save_with_relative_path_and_valid_sample_input_produ
         assert mlflow.mleap.FLAVOR_NAME in config.flavors
 
 
-@pytest.mark.large
 def test_mleap_module_model_save_with_absolute_path_and_valid_sample_input_produces_mleap_flavor(
     spark_model_iris, model_path
 ):
@@ -115,11 +122,12 @@ def test_mleap_module_model_save_with_absolute_path_and_valid_sample_input_produ
     assert mlflow.mleap.FLAVOR_NAME in config.flavors
 
 
-@pytest.mark.large
 def test_mleap_module_model_save_with_unsupported_transformer_raises_serialization_exception(
     spark_model_iris, model_path
 ):
-    class CustomTransformer(JavaModel):
+    from pyspark.ml.feature import VectorAssembler
+
+    class CustomTransformer(VectorAssembler):
         def _transform(self, dataset):
             return dataset
 
@@ -135,7 +143,6 @@ def test_mleap_module_model_save_with_unsupported_transformer_raises_serializati
         )
 
 
-@pytest.mark.large
 def test_mleap_model_log(spark_model_iris):
     artifact_path = "model"
     register_model_patch = mock.patch("mlflow.register_model")
@@ -146,9 +153,7 @@ def test_mleap_model_log(spark_model_iris):
             artifact_path=artifact_path,
             registered_model_name="Model1",
         )
-        model_uri = "runs:/{run_id}/{artifact_path}".format(
-            run_id=mlflow.active_run().info.run_id, artifact_path=artifact_path
-        )
+        model_uri = f"runs:/{mlflow.active_run().info.run_id}/{artifact_path}"
         assert model_info.model_uri == model_uri
         mlflow.register_model.assert_called_once_with(
             model_uri, "Model1", await_registration_for=DEFAULT_AWAIT_MAX_SLEEP_SECONDS
@@ -161,7 +166,6 @@ def test_mleap_model_log(spark_model_iris):
     assert mlflow.mleap.FLAVOR_NAME in mlflow_model.flavors
 
 
-@pytest.mark.large
 def test_spark_module_model_save_with_relative_path_and_valid_sample_input_produces_mleap_flavor(
     spark_model_iris,
 ):
@@ -182,18 +186,15 @@ def test_spark_module_model_save_with_relative_path_and_valid_sample_input_produ
         assert mlflow.mleap.FLAVOR_NAME in config.flavors
 
 
-@pytest.mark.large
 def test_mleap_module_model_save_with_invalid_sample_input_type_raises_exception(
     spark_model_iris, model_path
 ):
     with pytest.raises(Exception, match="must be a PySpark dataframe"):
-        invalid_input = pd.DataFrame()
         mlflow.spark.save_model(
-            spark_model=spark_model_iris.model, path=model_path, sample_input=invalid_input
+            spark_model=spark_model_iris.model, path=model_path, sample_input=pd.DataFrame()
         )
 
 
-@pytest.mark.large
 def test_spark_module_model_save_with_mleap_and_unsupported_transformer_raises_exception(
     spark_model_iris, model_path
 ):
@@ -208,3 +209,32 @@ def test_spark_module_model_save_with_mleap_and_unsupported_transformer_raises_e
         mlflow.spark.save_model(
             spark_model=unsupported_model, path=model_path, sample_input=spark_model_iris.spark_df
         )
+
+
+def test_model_save_load_with_metadata(spark_model_iris, model_path):
+    mlflow.mleap.save_model(
+        spark_model=spark_model_iris.model,
+        path=model_path,
+        sample_input=spark_model_iris.spark_df,
+        metadata={"metadata_key": "metadata_value"},
+    )
+
+    reloaded_model = Model.load(os.path.join(model_path, "MLmodel"))
+    assert reloaded_model.metadata["metadata_key"] == "metadata_value"
+
+
+def test_model_log_with_metadata(spark_model_iris):
+    artifact_path = "model"
+
+    with mlflow.start_run():
+        mlflow.mleap.log_model(
+            spark_model=spark_model_iris.model,
+            artifact_path=artifact_path,
+            sample_input=spark_model_iris.spark_df,
+            metadata={"metadata_key": "metadata_value"},
+        )
+        model_uri = mlflow.get_artifact_uri(artifact_path)
+
+    model_path = _download_artifact_from_uri(artifact_uri=model_uri)
+    reloaded_model = Model.load(os.path.join(model_path, "MLmodel"))
+    assert reloaded_model.metadata["metadata_key"] == "metadata_value"

@@ -1,15 +1,21 @@
 import json
 import math
+import re
 import numpy as np
 import pandas as pd
 import pytest
 from scipy.sparse import csr_matrix, csc_matrix
 
+from mlflow.pyfunc import _parse_spark_datatype
 from mlflow.exceptions import MlflowException
-from mlflow.pyfunc import _enforce_tensor_spec
+from mlflow.models.utils import _enforce_tensor_spec
 from mlflow.types import DataType
 from mlflow.types.schema import ColSpec, Schema, TensorSpec
-from mlflow.types.utils import _infer_schema, _get_tensor_shape
+from mlflow.types.utils import (
+    _infer_schema,
+    _get_tensor_shape,
+    _validate_input_dictionary_contains_only_strings_and_lists_of_strings,
+)
 
 
 def test_col_spec():
@@ -170,8 +176,6 @@ def test_schema_inference_on_pandas_series():
     assert schema == Schema([ColSpec(DataType.binary)])
     schema = _infer_schema(pd.Series(np.array([bytearray([1]), None], dtype=object)))
     assert schema == Schema([ColSpec(DataType.binary)])
-    schema = _infer_schema(pd.Series(np.array([True, None], dtype=object)))
-    assert schema == Schema([ColSpec(DataType.string)])
     schema = _infer_schema(pd.Series(np.array([1.1, None], dtype=object)))
     assert schema == Schema([ColSpec(DataType.double)])
 
@@ -226,6 +230,13 @@ def test_schema_inference_on_pandas_series():
         with pytest.raises(MlflowException, match="Unsupported numpy data type"):
             _infer_schema(pd.Series(np.array([1, 2, 3], dtype=np.float128)))
 
+    # test names
+    s = pd.Series([1, 2, 3])
+    if hasattr(s, "name"):
+        s.rename("test", inplace=True)
+        assert "test" in _infer_schema(s).input_names()
+        assert len(_infer_schema(s).input_names()) == 1
+
 
 def test_get_tensor_shape(dict_of_ndarrays):
     assert all(-1 == _get_tensor_shape(tensor)[0] for tensor in dict_of_ndarrays.values())
@@ -248,7 +259,9 @@ def test_get_tensor_shape(dict_of_ndarrays):
     ):
         _get_tensor_shape(data, -10)
 
-    with pytest.raises(TypeError, match="Data in the dictionary must be of type numpy.ndarray"):
+    with pytest.raises(
+        MlflowException, match="Invalid values in dictionary. If passing a dictionary"
+    ):
         _infer_schema({"x": 1})
 
 
@@ -277,11 +290,150 @@ def test_schema_inference_on_dictionary(dict_of_ndarrays):
         ]
     )
     # test exception is raised if non-numpy data in dictionary
-    match = "Data in the dictionary must be of type numpy.ndarray"
-    with pytest.raises(TypeError, match=match):
+    match = "Invalid values in dictionary. If passing a dictionary"
+    with pytest.raises(MlflowException, match=match):
         _infer_schema({"x": 1})
-    with pytest.raises(TypeError, match=match):
+    with pytest.raises(MlflowException, match=match):
         _infer_schema({"x": [1]})
+
+
+def test_schema_inference_on_string_input():
+    schema = _infer_schema("some string")
+    assert schema == Schema([ColSpec(DataType.string)])
+
+    with pytest.raises(TypeError, match="Expected one of the following types:"):
+        _infer_schema(1)
+
+
+def test_schema_inference_on_dictionary_of_strings():
+    for valid_data in [
+        {"a": "b", "c": "d"},
+        {"a": ["a", "b"], "b": ["c", "d"]},
+        {"a": "a", "b": ["a", "b"]},
+    ]:
+        schema = _infer_schema(valid_data)
+        assert schema == Schema([ColSpec(DataType.string, name) for name in valid_data])
+    for invalid_data in [{"a": 1, "b": "c"}, {"a": 1, "b": ["a", "b"]}]:
+        with pytest.raises(
+            MlflowException, match="Invalid values in dictionary. If passing a dictionary"
+        ):
+            _infer_schema(invalid_data)
+
+
+def test_schema_inference_validating_dictionary_keys():
+    valid_data = {"a": "b", "b": "c"}
+    schema = _infer_schema(valid_data)
+    assert schema == Schema([ColSpec(DataType.string, name) for name in valid_data])
+    for data in [{1.7: "a", "b": "c"}, {12.4: "c", "d": "e"}]:
+        with pytest.raises(
+            MlflowException, match="The dictionary keys are not all strings or indexes. Invalid "
+        ):
+            _infer_schema(data)
+
+
+def test_schema_inference_on_list_of_strings():
+    schema = _infer_schema(["a", "b", "c"])
+    assert schema == Schema([ColSpec(DataType.string)])
+
+    for data in [["a", 1], ["a", ["b", "c"]]]:
+        with pytest.raises(TypeError, match="Expected one of the following types"):
+            _infer_schema(data)
+
+
+def test_schema_inference_on_list_of_dicts():
+    schema = _infer_schema([{"a": "a", "b": "b"}, {"a": "a", "b": "b"}])
+    assert schema == Schema([ColSpec(DataType.string, "a"), ColSpec(DataType.string, "b")])
+
+    with pytest.raises(MlflowException, match="The list of dictionaries supplied has inconsistent"):
+        _infer_schema([{"a": "a", "b": "b"}, {"a": "c", "c": "invalid"}])
+    with pytest.raises(TypeError, match="Expected one of the following types:"):
+        _infer_schema([{"a": 1}, {"b": "a"}])
+
+
+def test_mixed_string_and_numpy_array_raises():
+    with pytest.raises(MlflowException, match="Invalid values in dictionary. If passing a"):
+        _infer_schema({"a": np.array([1, 2, 3]), "b": "c"})
+
+
+def test_dict_input_valid_checks_on_keys():
+    match = "The dictionary keys are not all strings or "
+    # User-defined keys
+
+    class Hashable:
+        def __init__(self, x: str, y: str):
+            self.x = x
+            self.y = y
+
+        def __hash__(self):
+            return hash((self.x, self.y))
+
+        def __eq__(self, other):
+            return isinstance(other, Hashable) and self.x == other.x and self.y == other.y
+
+    hash_obj_1 = Hashable("some", "custom")
+    hash_obj_2 = Hashable("some", "other")
+    custom_hashable_dict = {hash_obj_1: "value", hash_obj_2: "other_value"}
+
+    with pytest.raises(MlflowException, match=match):
+        _validate_input_dictionary_contains_only_strings_and_lists_of_strings(custom_hashable_dict)
+
+    # keys are floats
+    float_keys_dict = {1.1: "a", 2.2: "b"}
+
+    with pytest.raises(MlflowException, match=match):
+        _validate_input_dictionary_contains_only_strings_and_lists_of_strings(float_keys_dict)
+
+    # keys are bool
+    bool_keys_dict = {True: "a", False: "b"}
+
+    with pytest.raises(MlflowException, match=match):
+        _validate_input_dictionary_contains_only_strings_and_lists_of_strings(bool_keys_dict)
+    # keys are tuples
+    tuple_keys_dict = {("a", "b"): "a", ("a", "c"): "b"}
+
+    with pytest.raises(MlflowException, match=match):
+        _validate_input_dictionary_contains_only_strings_and_lists_of_strings(tuple_keys_dict)
+
+    # keys are frozenset
+    frozen_set_dict = {frozenset({"a", "b"}): "a", frozenset({"b", "c"}): "b"}
+
+    with pytest.raises(MlflowException, match=match):
+        _validate_input_dictionary_contains_only_strings_and_lists_of_strings(frozen_set_dict)
+
+
+def test_dict_input_valid_checks_on_values():
+    match = "Invalid values in dictionary. If passing a dictionary containing strings"
+
+    list_of_ints = {"a": [1, 2, 3], "b": [1, 2, 3]}
+    with pytest.raises(MlflowException, match=match):
+        _validate_input_dictionary_contains_only_strings_and_lists_of_strings(list_of_ints)
+
+    list_of_floats = {"a": [1.1, 1.2], "b": [1.1, 2.2]}
+    with pytest.raises(MlflowException, match=match):
+        _validate_input_dictionary_contains_only_strings_and_lists_of_strings(list_of_floats)
+
+    list_of_dics = {"a": [{"a": "b"}, {"b": "c"}], "b": [{"a": "c"}, {"b": "d"}]}
+    with pytest.raises(MlflowException, match=match):
+        _validate_input_dictionary_contains_only_strings_and_lists_of_strings(list_of_dics)
+
+    list_of_lists = {"a": [["b", "c"], ["d", "e"]], "b": [["e", "f"], ["g", "h"]]}
+    with pytest.raises(MlflowException, match=match):
+        _validate_input_dictionary_contains_only_strings_and_lists_of_strings(list_of_lists)
+
+    list_of_set = {"a": [{"b", "c"}, {"d", "e"}], "b": [{"a", "c"}, {"d", "f"}]}
+    with pytest.raises(MlflowException, match=match):
+        _validate_input_dictionary_contains_only_strings_and_lists_of_strings(list_of_set)
+
+    list_of_frozen_set = {
+        "a": [frozenset({"b", "c"}), frozenset({"d", "e"})],
+        "b": [frozenset({"a", "c"}), frozenset({"d", "f"})],
+    }
+    with pytest.raises(MlflowException, match=match):
+        _validate_input_dictionary_contains_only_strings_and_lists_of_strings(list_of_frozen_set)
+
+    list_of_bool = {"a": [True, True, False], "b": [False, False, True]}
+    with pytest.raises(MlflowException, match=match):
+        _validate_input_dictionary_contains_only_strings_and_lists_of_strings(list_of_bool)
 
 
 def test_schema_inference_on_basic_numpy(pandas_df_with_all_types):
@@ -413,32 +565,30 @@ def test_all_numpy_dtypes():
             test_dtype(np.array([1.1, -2.2, 3.3, 5.12], dtype=dtype), dtype)
 
 
-@pytest.mark.large
 def test_spark_schema_inference(pandas_df_with_all_types):
     import pyspark
-    from pyspark.sql.types import _parse_datatype_string, StructField, StructType
+    from pyspark.sql.types import StructField, StructType
 
     pandas_df_with_all_types = pandas_df_with_all_types.drop(
         columns=["boolean_ext", "integer_ext", "string_ext"]
     )
     schema = _infer_schema(pandas_df_with_all_types)
     assert schema == Schema([ColSpec(x, x) for x in pandas_df_with_all_types.columns])
-    spark_session = pyspark.sql.SparkSession(pyspark.SparkContext.getOrCreate())
+    with pyspark.sql.SparkSession.builder.getOrCreate() as spark:
+        struct_fields = []
+        for t in schema.input_types():
+            if t == DataType.datetime:
+                struct_fields.append(
+                    StructField("datetime", _parse_spark_datatype("timestamp"), True)
+                )
+            else:
+                struct_fields.append(StructField(t.name, _parse_spark_datatype(t.name), True))
+        spark_schema = StructType(struct_fields)
+        sparkdf = spark.createDataFrame(pandas_df_with_all_types, schema=spark_schema)
+        schema = _infer_schema(sparkdf)
+        assert schema == Schema([ColSpec(x, x) for x in pandas_df_with_all_types.columns])
 
-    struct_fields = []
-    for t in schema.input_types():
-        # pyspark _parse_datatype_string() expects "timestamp" instead of "datetime"
-        if t == DataType.datetime:
-            struct_fields.append(StructField("datetime", _parse_datatype_string("timestamp"), True))
-        else:
-            struct_fields.append(StructField(t.name, _parse_datatype_string(t.name), True))
-    spark_schema = StructType(struct_fields)
-    sparkdf = spark_session.createDataFrame(pandas_df_with_all_types, schema=spark_schema)
-    schema = _infer_schema(sparkdf)
-    assert schema == Schema([ColSpec(x, x) for x in pandas_df_with_all_types.columns])
 
-
-@pytest.mark.large
 def test_spark_type_mapping(pandas_df_with_all_types):
     import pyspark
     from pyspark.sql.types import (
@@ -487,3 +637,34 @@ def test_spark_type_mapping(pandas_df_with_all_types):
     schema = Schema([ColSpec(DataType.integer)])
     spark_type = schema.as_spark_schema()
     assert isinstance(spark_type, IntegerType)
+
+
+def test_enforce_tensor_spec_variable_signature():
+    standard_array = np.array([[[1, 2, 3], [1, 2, 3]], [[1, 2, 3], [1, 2, 3]]], dtype=np.int32)
+    ragged_array = np.array([[[1, 2, 3], [1, 2, 3]], [[1, 2, 3]]], dtype=object)
+    inferred_schema = _infer_schema(ragged_array)
+    inferred_spec = inferred_schema.inputs[0]
+    assert inferred_spec.shape == (-1,)
+    assert inferred_spec.type == np.dtype(object)
+
+    result_array = _enforce_tensor_spec(standard_array, inferred_spec)
+    np.testing.assert_array_equal(standard_array, result_array)
+    result_array = _enforce_tensor_spec(ragged_array, inferred_spec)
+    np.testing.assert_array_equal(ragged_array, result_array)
+
+    manual_spec = TensorSpec(np.dtype(np.int32), (-1, -1, 3))
+    result_array = _enforce_tensor_spec(standard_array, manual_spec)
+    np.testing.assert_array_equal(standard_array, result_array)
+    result_array = _enforce_tensor_spec(ragged_array, manual_spec)
+    np.testing.assert_array_equal(ragged_array, result_array)
+
+    standard_spec = _infer_schema(standard_array).inputs[0]
+    assert standard_spec.shape == (-1, 2, 3)
+
+    result_array = _enforce_tensor_spec(standard_array, standard_spec)
+    np.testing.assert_array_equal(standard_array, result_array)
+    with pytest.raises(
+        MlflowException,
+        match=re.escape(r"Shape of input (2,) does not match expected shape (-1, 2, 3)."),
+    ):
+        _enforce_tensor_spec(ragged_array, standard_spec)

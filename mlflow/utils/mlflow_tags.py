@@ -12,6 +12,9 @@ MLFLOW_RUN_NOTE = "mlflow.note.content"
 MLFLOW_PARENT_RUN_ID = "mlflow.parentRunId"
 MLFLOW_USER = "mlflow.user"
 MLFLOW_SOURCE_TYPE = "mlflow.source.type"
+MLFLOW_RECIPE_TEMPLATE_NAME = "mlflow.pipeline.template.name"
+MLFLOW_RECIPE_STEP_NAME = "mlflow.pipeline.step.name"
+MLFLOW_RECIPE_PROFILE_NAME = "mlflow.pipeline.profile.name"
 MLFLOW_SOURCE_NAME = "mlflow.source.name"
 MLFLOW_GIT_COMMIT = "mlflow.source.git.commit"
 MLFLOW_GIT_BRANCH = "mlflow.source.git.branch"
@@ -23,6 +26,8 @@ MLFLOW_DOCKER_IMAGE_URI = "mlflow.docker.image.uri"
 MLFLOW_DOCKER_IMAGE_ID = "mlflow.docker.image.id"
 # Indicates that an MLflow run was created by an autologging integration
 MLFLOW_AUTOLOGGING = "mlflow.autologging"
+# Indicates the artifacts type and path that are logged
+MLFLOW_LOGGED_ARTIFACTS = "mlflow.loggedArtifacts"
 
 MLFLOW_DATABRICKS_NOTEBOOK_ID = "mlflow.databricks.notebookID"
 MLFLOW_DATABRICKS_NOTEBOOK_PATH = "mlflow.databricks.notebookPath"
@@ -45,9 +50,31 @@ MLFLOW_DATABRICKS_JOB_RUN_ID = "mlflow.databricks.jobRunID"
 # implies the job type which could be normal, ephemeral, etc.
 MLFLOW_DATABRICKS_JOB_TYPE = "mlflow.databricks.jobType"
 MLFLOW_DATABRICKS_JOB_TYPE_INFO = "mlflow.databricks.jobTypeInfo"
+# For MLflow Repo Lineage tracking
+MLFLOW_DATABRICKS_GIT_REPO_URL = "mlflow.databricks.gitRepoUrl"
+MLFLOW_DATABRICKS_GIT_REPO_COMMIT = "mlflow.databricks.gitRepoCommit"
+MLFLOW_DATABRICKS_GIT_REPO_PROVIDER = "mlflow.databricks.gitRepoProvider"
+MLFLOW_DATABRICKS_GIT_REPO_RELATIVE_PATH = "mlflow.databricks.gitRepoRelativePath"
+MLFLOW_DATABRICKS_GIT_REPO_REFERENCE = "mlflow.databricks.gitRepoReference"
+MLFLOW_DATABRICKS_GIT_REPO_REFERENCE_TYPE = "mlflow.databricks.gitRepoReferenceType"
+MLFLOW_DATABRICKS_GIT_REPO_STATUS = "mlflow.databricks.gitRepoStatus"
+
+# For MLflow Dataset tracking
+MLFLOW_DATASET_CONTEXT = "mlflow.data.context"
 
 MLFLOW_PROJECT_BACKEND = "mlflow.project.backend"
 
 # The following legacy tags are deprecated and will be removed by MLflow 1.0.
 LEGACY_MLFLOW_GIT_BRANCH_NAME = "mlflow.gitBranchName"  # Replaced with mlflow.source.git.branch
 LEGACY_MLFLOW_GIT_REPO_URL = "mlflow.gitRepoURL"  # Replaced with mlflow.source.git.repoURL
+
+MLFLOW_EXPERIMENT_PRIMARY_METRIC_NAME = "mlflow.experiment.primaryMetric.name"
+MLFLOW_EXPERIMENT_PRIMARY_METRIC_GREATER_IS_BETTER = (
+    "mlflow.experiment.primaryMetric.greaterIsBetter"
+)
+
+
+def _get_run_name_from_tags(tags):
+    for tag in tags:
+        if tag.key == MLFLOW_RUN_NAME:
+            return tag.value

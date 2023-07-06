@@ -9,6 +9,8 @@ import tarfile
 import logging
 import time
 import platform
+import json
+import signal
 
 import mlflow
 import mlflow.version
@@ -19,11 +21,11 @@ from mlflow.models.model import MLMODEL_FILE_NAME
 from mlflow.protos.databricks_pb2 import RESOURCE_DOES_NOT_EXIST, INVALID_PARAMETER_VALUE
 from mlflow.tracking.artifact_utils import _download_artifact_from_uri
 from mlflow.utils import get_unique_resource_id
-from mlflow.utils.annotations import experimental
 from mlflow.utils.file_utils import TempDir
 from mlflow.models.container import SUPPORTED_FLAVORS as SUPPORTED_DEPLOYMENT_FLAVORS
 from mlflow.models.container import DEPLOYMENT_CONFIG_KEY_FLAVOR_NAME, SERVING_ENVIRONMENT
-from mlflow.deployments import BaseDeploymentClient
+from mlflow.deployments import BaseDeploymentClient, PredictionsResponse
+from mlflow.utils.proto_json_utils import dump_input_data
 
 
 DEFAULT_IMAGE_NAME = "mlflow-pyfunc"
@@ -34,8 +36,6 @@ DEPLOYMENT_MODE_CREATE = "create"
 DEPLOYMENT_MODES = [DEPLOYMENT_MODE_CREATE, DEPLOYMENT_MODE_ADD, DEPLOYMENT_MODE_REPLACE]
 
 IMAGE_NAME_ENV_VAR = "MLFLOW_SAGEMAKER_DEPLOY_IMG_URL"
-# Deprecated as of MLflow 1.0.
-DEPRECATED_IMAGE_NAME_ENV_VAR = "SAGEMAKER_DEPLOY_IMG_URL"
 
 DEFAULT_BUCKET_NAME_PREFIX = "mlflow-sagemaker"
 
@@ -89,10 +89,8 @@ def _validate_deployment_flavor(model_config, flavor):
     if flavor not in SUPPORTED_DEPLOYMENT_FLAVORS:
         raise MlflowException(
             message=(
-                "The specified flavor: `{flavor_name}` is not supported for deployment."
-                " Please use one of the supported flavors: {supported_flavor_names}".format(
-                    flavor_name=flavor, supported_flavor_names=SUPPORTED_DEPLOYMENT_FLAVORS
-                )
+                f"The specified flavor: `{flavor}` is not supported for deployment."
+                f" Please use one of the supported flavors: {SUPPORTED_DEPLOYMENT_FLAVORS}"
             ),
             error_code=INVALID_PARAMETER_VALUE,
         )
@@ -143,16 +141,16 @@ def push_image_to_ecr(image=DEFAULT_IMAGE_NAME):
     docker_login_cmd = (
         "aws ecr get-login-password"
         " | docker login  --username AWS "
-        " --password-stdin "
-        "{account}.dkr.ecr.{region}.amazonaws.com".format(account=account, region=region)
+        "--password-stdin "
+        f"{account}.dkr.ecr.{region}.amazonaws.com"
     )
 
     os_command_separator = ";\n"
     if platform.system() == "Windows":
         os_command_separator = " && "
 
-    docker_tag_cmd = "docker tag {image} {fullname}".format(image=image, fullname=fullname)
-    docker_push_cmd = "docker push {}".format(fullname)
+    docker_tag_cmd = f"docker tag {image} {fullname}"
+    docker_push_cmd = f"docker push {fullname}"
 
     cmd = os_command_separator.join([docker_login_cmd, docker_tag_cmd, docker_push_cmd])
 
@@ -160,7 +158,7 @@ def push_image_to_ecr(image=DEFAULT_IMAGE_NAME):
     os.system(cmd)
 
 
-def deploy(
+def _deploy(
     app_name,
     model_uri,
     execution_role_arn=None,
@@ -176,6 +174,11 @@ def deploy(
     flavor=None,
     synchronous=True,
     timeout_seconds=1200,
+    data_capture_config=None,
+    variant_name=None,
+    async_inference_config=None,
+    env=None,
+    tags=None,
 ):
     """
     Deploy an MLflow model on AWS SageMaker.
@@ -260,19 +263,20 @@ def deploy(
                        #SageMaker.Client.create_model>`_. For more information, see
                        https://docs.aws.amazon.com/sagemaker/latest/dg/API_VpcConfig.html.
 
-    .. code-block:: python
-        :caption: Example
+                       .. code-block:: python
+                           :caption: Example
 
-        import mlflow.sagemaker as mfs
-        vpc_config = {
-                        'SecurityGroupIds': [
-                            'sg-123456abc',
-                        ],
-                        'Subnets': [
-                            'subnet-123456abc',
-                        ]
-                     }
-        mfs.deploy(..., vpc_config=vpc_config)
+                            import mlflow.sagemaker as mfs
+
+                            vpc_config = {
+                                "SecurityGroupIds": [
+                                    "sg-123456abc",
+                                ],
+                                "Subnets": [
+                                    "subnet-123456abc",
+                                ],
+                            }
+                            mfs.deploy(..., vpc_config=vpc_config)
 
     :param flavor: The name of the flavor of the model to use for deployment. Must be either
                    ``None`` or one of mlflow.sagemaker.SUPPORTED_DEPLOYMENT_FLAVORS. If ``None``,
@@ -291,6 +295,41 @@ def deploy(
                             responsible for monitoring the health and status of the pending
                             deployment using native SageMaker APIs or the AWS console. If
                             ``synchronous`` is ``False``, this parameter is ignored.
+    :param data_capture_config: A dictionary specifying the data capture configuration to use when
+                                creating the new SageMaker model associated with this application.
+                                For more information, see
+                                https://docs.aws.amazon.com/sagemaker/latest/APIReference/API_DataCaptureConfig.html.
+
+                                .. code-block:: python
+                                    :caption: Example
+
+                                    import mlflow.sagemaker as mfs
+
+                                    data_capture_config = {
+                                        "EnableCapture": True,
+                                        "InitalSamplingPercentage": 100,
+                                        "DestinationS3Uri": "s3://my-bucket/path",
+                                        "CaptureOptions": [{"CaptureMode": "Output"}],
+                                    }
+                                    mfs.deploy(..., data_capture_config=data_capture_config)
+
+    :param variant_name: The name to assign to the new production variant.
+    :param async_inference_config: The name to assign to the endpoint_config
+                                    on the sagemaker endpoint.
+                                    .. code-block:: python
+                                        :caption: Example
+                                            "AsyncInferenceConfig": {
+                                                "ClientConfig": {
+                                                    "MaxConcurrentInvocationsPerInstance": 4  # pylint: disable=line-too-long
+                                                },
+                                                "OutputConfig": {
+                                                    "S3OutputPath": "s3://<path-to-output-bucket>",  # pylint: disable=line-too-long
+                                                    "NotificationConfig": {},  # pylint: disable=line-too-long
+                                                },
+                                            }
+
+    :param env: An optional dictionary of environment variables to set for the model.
+    :param tags: An optional dictionary of tags to apply to the endpoint.
     """
     import boto3
 
@@ -316,8 +355,9 @@ def deploy(
     if not os.path.exists(model_config_path):
         raise MlflowException(
             message=(
-                "Failed to find {} configuration within the specified model's root directory."
-            ).format(MLMODEL_FILE_NAME),
+                f"Failed to find {MLMODEL_FILE_NAME} configuration within the specified model's "
+                "root directory."
+            ),
             error_code=INVALID_PARAMETER_VALUE,
         )
     model_config = Model.load(model_config_path)
@@ -337,20 +377,16 @@ def deploy(
     if endpoint_exists and mode == DEPLOYMENT_MODE_CREATE:
         raise MlflowException(
             message=(
-                "You are attempting to deploy an application with name: {application_name} in"
-                " '{mode_create}' mode. However, an application with the same name already"
-                " exists. If you want to update this application, deploy in '{mode_add}' or"
-                " '{mode_replace}' mode.".format(
-                    application_name=app_name,
-                    mode_create=DEPLOYMENT_MODE_CREATE,
-                    mode_add=DEPLOYMENT_MODE_ADD,
-                    mode_replace=DEPLOYMENT_MODE_REPLACE,
-                )
+                f"You are attempting to deploy an application with name: {app_name} in"
+                f" '{DEPLOYMENT_MODE_CREATE}' mode. However, an application with the same name"
+                " already exists. If you want to update this application, deploy in"
+                f" '{DEPLOYMENT_MODE_ADD}' or '{DEPLOYMENT_MODE_REPLACE}' mode."
             ),
             error_code=INVALID_PARAMETER_VALUE,
         )
 
     model_name = _get_sagemaker_model_name(endpoint_name=app_name)
+
     if not image_url:
         image_url = _get_default_image_url(region_name=region_name)
     if not execution_role_arn:
@@ -383,6 +419,11 @@ def deploy(
             role=execution_role_arn,
             sage_client=sage_client,
             s3_client=s3_client,
+            variant_name=variant_name,
+            async_inference_config=async_inference_config,
+            data_capture_config=data_capture_config,
+            env=env,
+            tags=tags,
         )
     else:
         deployment_operation = _create_sagemaker_endpoint(
@@ -395,8 +436,13 @@ def deploy(
             instance_type=instance_type,
             instance_count=instance_count,
             vpc_config=vpc_config,
+            data_capture_config=data_capture_config,
             role=execution_role_arn,
             sage_client=sage_client,
+            variant_name=variant_name,
+            async_inference_config=async_inference_config,
+            env=env,
+            tags=tags,
         )
 
     if synchronous:
@@ -410,7 +456,7 @@ def deploy(
         else:
             raise MlflowException(
                 "The deployment operation failed with the following error message:"
-                ' "{error_message}"'.format(error_message=operation_status.message)
+                f' "{operation_status.message}"'
             )
         if not archive:
             deployment_operation.clean_up()
@@ -418,7 +464,7 @@ def deploy(
     return app_name, flavor
 
 
-def delete(
+def _delete(
     app_name,
     region_name="us-west-2",
     assume_role_arn=None,
@@ -512,13 +558,12 @@ def delete(
         else:
             raise MlflowException(
                 "The deletion operation failed with the following error message:"
-                ' "{error_message}"'.format(error_message=operation_status.message)
+                f' "{operation_status.message}"'
             )
         if not archive:
             delete_operation.clean_up()
 
 
-@experimental
 def deploy_transform_job(
     job_name,
     model_uri,
@@ -612,19 +657,20 @@ def deploy_transform_job(
                        #SageMaker.Client.create_model>`_. For more information, see
                        https://docs.aws.amazon.com/sagemaker/latest/dg/API_VpcConfig.html.
 
-    .. code-block:: python
-        :caption: Example
+                       .. code-block:: python
+                           :caption: Example
 
-        import mlflow.sagemaker as mfs
-        vpc_config = {
-                        'SecurityGroupIds': [
-                            'sg-123456abc',
-                        ],
-                        'Subnets': [
-                            'subnet-123456abc',
-                        ]
-                     }
-        mfs.deploy_transform_job(..., vpc_config=vpc_config)
+                            import mlflow.sagemaker as mfs
+
+                            vpc_config = {
+                                "SecurityGroupIds": [
+                                    "sg-123456abc",
+                                ],
+                                "Subnets": [
+                                    "subnet-123456abc",
+                                ],
+                            }
+                            mfs.deploy_transform_job(..., vpc_config=vpc_config)
 
     :param flavor: The name of the flavor of the model to use for deployment. Must be either
                    ``None`` or one of mlflow.sagemaker.SUPPORTED_DEPLOYMENT_FLAVORS. If ``None``,
@@ -665,8 +711,9 @@ def deploy_transform_job(
     if not os.path.exists(model_config_path):
         raise MlflowException(
             message=(
-                "Failed to find {} configuration within the specified model's root directory."
-            ).format(MLMODEL_FILE_NAME),
+                f"Failed to find {MLMODEL_FILE_NAME} configuration within the specified model's"
+                " root directory."
+            ),
             error_code=INVALID_PARAMETER_VALUE,
         )
     model_config = Model.load(model_config_path)
@@ -688,10 +735,8 @@ def deploy_transform_job(
     if transform_job_exists:
         raise MlflowException(
             message=(
-                "You are attempting to deploy a batch transform job with name: {job_name}."
-                "However, a batch transform job with the same name already exists.".format(
-                    job_name=job_name
-                )
+                f"You are attempting to deploy a batch transform job with name: {job_name}. "
+                "However, a batch transform job with the same name already exists."
             ),
             error_code=INVALID_PARAMETER_VALUE,
         )
@@ -757,7 +802,6 @@ def deploy_transform_job(
             deployment_operation.clean_up()
 
 
-@experimental
 def terminate_transform_job(
     job_name,
     region_name="us-west-2",
@@ -820,8 +864,8 @@ def terminate_transform_job(
 
         if transform_job_info["TransformJobStatus"] == "Stopping":
             return _SageMakerOperationStatus.in_progress(
-                "Termination is still in progress. Current batch transform job status:\
-                    {transform_job_status}".format(
+                "Termination is still in progress. Current batch transform job status: "
+                "{transform_job_status}".format(
                     transform_job_status=transform_job_info["TransformJobStatus"]
                 )
             )
@@ -855,7 +899,6 @@ def terminate_transform_job(
             stop_operation.clean_up()
 
 
-@experimental
 def push_model_to_sagemaker(
     model_name,
     model_uri,
@@ -868,7 +911,7 @@ def push_model_to_sagemaker(
     flavor=None,
 ):
     """
-    Push an MLflow model to AWS SageMaker model registry.
+    Create a SageMaker Model from an MLflow model artifact.
     The currently active AWS account must have correct permissions set up.
 
     :param model_name: Name of the Sagemaker model.
@@ -914,19 +957,20 @@ def push_model_to_sagemaker(
                        #SageMaker.Client.create_model>`_. For more information, see
                        https://docs.aws.amazon.com/sagemaker/latest/dg/API_VpcConfig.html.
 
-    .. code-block:: python
-        :caption: Example
+                       .. code-block:: python
+                           :caption: Example
 
-        import mlflow.sagemaker as mfs
-        vpc_config = {
-                        'SecurityGroupIds': [
-                            'sg-123456abc',
-                        ],
-                        'Subnets': [
-                            'subnet-123456abc',
-                        ]
-                     }
-        mfs.push_model_to_sagemaker(..., vpc_config=vpc_config)
+                            import mlflow.sagemaker as mfs
+
+                            vpc_config = {
+                                "SecurityGroupIds": [
+                                    "sg-123456abc",
+                                ],
+                                "Subnets": [
+                                    "subnet-123456abc",
+                                ],
+                            }
+                            mfs.push_model_to_sagemaker(..., vpc_config=vpc_config)
 
     :param flavor: The name of the flavor of the model to use for deployment. Must be either
                    ``None`` or one of mlflow.sagemaker.SUPPORTED_DEPLOYMENT_FLAVORS. If ``None``,
@@ -941,8 +985,9 @@ def push_model_to_sagemaker(
     if not os.path.exists(model_config_path):
         raise MlflowException(
             message=(
-                "Failed to find {} configuration within the specified model's root directory."
-            ).format(MLMODEL_FILE_NAME),
+                f"Failed to find {MLMODEL_FILE_NAME} configuration within the specified model's"
+                " root directory."
+            ),
             error_code=INVALID_PARAMETER_VALUE,
         )
     model_config = Model.load(model_config_path)
@@ -961,8 +1006,8 @@ def push_model_to_sagemaker(
     if _does_model_exist(model_name=model_name, sage_client=sage_client):
         raise MlflowException(
             message=(
-                "You are attempting to create a Sagemaker model with name: {model_name}."
-                "However, a model with the same name already exists.".format(model_name=model_name)
+                f"You are attempting to create a Sagemaker model with name: {model_name}. "
+                "However, a model with the same name already exists."
             ),
             error_code=INVALID_PARAMETER_VALUE,
         )
@@ -993,17 +1038,23 @@ def push_model_to_sagemaker(
         image_url=image_url,
         execution_role=execution_role_arn,
         sage_client=sage_client,
+        env={},
+        tags={},
     )
 
     _logger.info("Created Sagemaker model with arn: %s", model_response["ModelArn"])
 
 
-def run_local(model_uri, port=5000, image=DEFAULT_IMAGE_NAME, flavor=None):
+def run_local(name, model_uri, flavor=None, config=None):  # pylint: disable=unused-argument
     """
-    Serve model locally in a SageMaker compatible Docker container.
+    Serve the model locally in a SageMaker compatible Docker container.
 
-    :param model_uri: The location, in URI format, of the MLflow model to serve locally,
-                      for example:
+    Note that models deployed locally cannot be managed by other deployment APIs
+    (e.g. ``update_deployment``, ``delete_deployment``, etc).
+
+    :param name: Name of the local serving application.
+    :param model_uri: The location, in URI format, of the MLflow model to deploy locally.
+                      For example:
 
                       - ``/Users/me/path/to/local/model``
                       - ``relative/path/to/local/model``
@@ -1015,13 +1066,47 @@ def run_local(model_uri, port=5000, image=DEFAULT_IMAGE_NAME, flavor=None):
                       For more information about supported URI schemes, see
                       `Referencing Artifacts <https://www.mlflow.org/docs/latest/concepts.html#
                       artifact-locations>`_.
+    :param flavor: The name of the flavor of the model to use for deployment. Must be either
+                   ``None`` or one of mlflow.sagemaker.SUPPORTED_DEPLOYMENT_FLAVORS.
+                   If ``None``, a flavor is automatically selected from the model's available
+                   flavors. If the specified flavor is not present or not supported for
+                   deployment, an exception will be thrown.
+    :param config: Configuration parameters. The supported parameters are:
 
-    :param port: Local port.
-    :param image: Name of the Docker image to be used.
-    :param flavor: The name of the flavor of the model to use for local serving. If ``None``,
-                   a flavor is automatically selected from the model's available flavors. If the
-                   specified flavor is not present or not supported for deployment, an exception
-                   is thrown.
+                   - ``image``: The name of the Docker image to use for model serving. Defaults
+                                to ``"mlflow-pyfunc"``.
+                   - ``port``: The port at which to expose the model server on the local host.
+                               Defaults to ``5000``.
+
+    .. code-block:: python
+        :caption: Python example
+
+        from mlflow.models import build_docker
+        from mlflow.deployments import get_deploy_client
+
+        build_docker(name="mlflow-pyfunc")
+
+        client = get_deploy_client("sagemaker")
+        client.run_local(
+            name="my-local-deployment",
+            model_uri="/mlruns/0/abc/model",
+            flavor="python_function",
+            config={
+                "port": 5000,
+                "image": "mlflow-pyfunc",
+            },
+        )
+
+    .. code-block:: bash
+        :caption:  Command-line example
+
+        mlflow models build-docker --name "mlflow-pyfunc"
+        mlflow deployments run-local --target sagemaker \\
+                --name my-local-deployment \\
+                --model-uri "/mlruns/0/abc/model" \\
+                --flavor python_function \\
+                -C port=5000 \\
+                -C image="mlflow-pyfunc"
     """
     model_path = _download_artifact_from_uri(model_uri)
     model_config_path = os.path.join(model_path, MLMODEL_FILE_NAME)
@@ -1033,12 +1118,15 @@ def run_local(model_uri, port=5000, image=DEFAULT_IMAGE_NAME, flavor=None):
         _validate_deployment_flavor(model_config, flavor)
     _logger.info("Using the %s flavor for local serving!", flavor)
 
+    image = config.get("image", DEFAULT_IMAGE_NAME)
+    port = int(config.get("port", 5000))
+
     deployment_config = _get_deployment_config(flavor_name=flavor)
 
     _logger.info("launching docker image with path %s", model_path)
-    cmd = ["docker", "run", "-v", "{}:/opt/ml/model/".format(model_path), "-p", "%d:8080" % port]
+    cmd = ["docker", "run", "-v", f"{model_path}:/opt/ml/model/", "-p", "%d:8080" % port]
     for key, value in deployment_config.items():
-        cmd += ["-e", "{key}={value}".format(key=key, value=value)]
+        cmd += ["-e", f"{key}={value}"]
     cmd += ["--rm", image, "serve"]
     _logger.info("executing: %s", " ".join(cmd))
     proc = Popen(cmd, stdout=sys.stdout, stderr=sys.stderr, text=True)
@@ -1047,8 +1135,6 @@ def run_local(model_uri, port=5000, image=DEFAULT_IMAGE_NAME, flavor=None):
         _logger.info("received termination signal => killing docker process")
         proc.send_signal(signal.SIGINT)
 
-    import signal
-
     signal.signal(signal.SIGTERM, _sigterm_handler)
     proc.wait()
 
@@ -1056,11 +1142,8 @@ def run_local(model_uri, port=5000, image=DEFAULT_IMAGE_NAME, flavor=None):
 def target_help():
     """
     Provide help information for the SageMaker deployment client.
-
-    :return:
-    :rtype: str
     """
-    help_str = """\
+    return """\
     For detailed documentation on the SageMaker deployment client, please visit
     https://mlflow.org/docs/latest/python_api/mlflow.sagemaker.html#mlflow.sagemaker.SageMakerDeploymentClient
 
@@ -1079,7 +1162,6 @@ def target_help():
     The `delete` command accepts configurations to archive a model instead of deleting, execute
     in asynchronous mode and timeout period.
     """
-    return help_str
 
 
 def _get_default_image_url(region_name):
@@ -1087,15 +1169,6 @@ def _get_default_image_url(region_name):
 
     env_img = os.environ.get(IMAGE_NAME_ENV_VAR)
     if env_img:
-        return env_img
-
-    env_img = os.environ.get(DEPRECATED_IMAGE_NAME_ENV_VAR)
-    if env_img:
-        _logger.warning(
-            "Environment variable '%s' is deprecated, please use '%s' instead",
-            DEPRECATED_IMAGE_NAME_ENV_VAR,
-            IMAGE_NAME_ENV_VAR,
-        )
         return env_img
 
     ecr_client = boto3.client("ecr", region_name=region_name)
@@ -1143,7 +1216,7 @@ def _assume_role_and_get_credentials(assume_role_arn=None):
     import boto3
 
     if not assume_role_arn:
-        return dict()
+        return {}
 
     sts_client = boto3.client("sts")
     sts_response = sts_client.assume_role(
@@ -1152,11 +1225,11 @@ def _assume_role_and_get_credentials(assume_role_arn=None):
 
     _logger.info("Assuming role %s for deployment!", assume_role_arn)
 
-    return dict(
-        aws_access_key_id=sts_response["Credentials"]["AccessKeyId"],
-        aws_secret_access_key=sts_response["Credentials"]["SecretAccessKey"],
-        aws_session_token=sts_response["Credentials"]["SessionToken"],
-    )
+    return {
+        "aws_access_key_id": sts_response["Credentials"]["AccessKeyId"],
+        "aws_secret_access_key": sts_response["Credentials"]["SecretAccessKey"],
+        "aws_session_token": sts_response["Credentials"]["SessionToken"],
+    }
 
 
 def _get_default_s3_bucket(region_name, **assume_role_credentials):
@@ -1165,9 +1238,7 @@ def _get_default_s3_bucket(region_name, **assume_role_credentials):
     # create bucket if it does not exist
     sess = boto3.Session()
     account_id = _get_account_id(**assume_role_credentials)
-    bucket_name = "{pfx}-{rn}-{aid}".format(
-        pfx=DEFAULT_BUCKET_NAME_PREFIX, rn=region_name, aid=account_id
-    )
+    bucket_name = f"{DEFAULT_BUCKET_NAME_PREFIX}-{region_name}-{account_id}"
     s3 = sess.client("s3", **assume_role_credentials)
     response = s3.list_buckets()
     buckets = [b["Name"] for b in response["Buckets"]]
@@ -1226,10 +1297,10 @@ def _upload_s3(local_model_path, bucket, prefix, region_name, s3_client, **assum
                 Bucket=bucket, Key=key, Tagging={"TagSet": [{"Key": "SageMaker", "Value": "true"}]}
             )
             _logger.info("tag response: %s", response)
-            return "s3://{}/{}".format(bucket, key)
+            return f"s3://{bucket}/{key}"
 
 
-def _get_deployment_config(flavor_name):
+def _get_deployment_config(flavor_name, env_override=None):
     """
     :return: The deployment configuration as a dictionary
     """
@@ -1237,19 +1308,31 @@ def _get_deployment_config(flavor_name):
         DEPLOYMENT_CONFIG_KEY_FLAVOR_NAME: flavor_name,
         SERVING_ENVIRONMENT: SAGEMAKER_SERVING_ENVIRONMENT,
     }
+    if env_override:
+        deployment_config.update(env_override)
+
+    if os.getenv("http_proxy") is not None:
+        deployment_config.update({"http_proxy": os.environ["http_proxy"]})
+
+    if os.getenv("https_proxy") is not None:
+        deployment_config.update({"https_proxy": os.environ["https_proxy"]})
+
+    if os.getenv("no_proxy") is not None:
+        deployment_config.update({"no_proxy": os.environ["no_proxy"]})
+
     return deployment_config
 
 
 def _get_sagemaker_model_name(endpoint_name):
-    return "{en}-model-{uid}".format(en=endpoint_name, uid=get_unique_resource_id())
+    return f"{endpoint_name}-model-{get_unique_resource_id()}"
 
 
 def _get_sagemaker_transform_model_name(job_name):
-    return "{bn}-model-{uid}".format(bn=job_name, uid=get_unique_resource_id())
+    return f"{job_name}-model-{get_unique_resource_id()}"
 
 
 def _get_sagemaker_config_name(endpoint_name):
-    return "{en}-config-{uid}".format(en=endpoint_name, uid=get_unique_resource_id())
+    return f"{endpoint_name}-config-{get_unique_resource_id()}"
 
 
 def _create_sagemaker_transform_job(
@@ -1319,6 +1402,8 @@ def _create_sagemaker_transform_job(
         image_url=image_url,
         execution_role=role,
         sage_client=sage_client,
+        env={},
+        tags={},
     )
     _logger.info("Created model with arn: %s", model_response["ModelArn"])
 
@@ -1367,9 +1452,8 @@ def _create_sagemaker_transform_job(
         transform_job_status = transform_job_info["TransformJobStatus"]
         if transform_job_status == "InProgress":
             return _SageMakerOperationStatus.in_progress(
-                'Waiting for batch transform job to reach the "Completed" state. \
-                    Current batch transform job status:'
-                ' "{transform_job_status}"'.format(transform_job_status=transform_job_status)
+                'Waiting for batch transform job to reach the "Completed" state.                   '
+                f'  Current batch transform job status: "{transform_job_status}"'
             )
         elif transform_job_status == "Completed":
             return _SageMakerOperationStatus.succeeded(
@@ -1378,10 +1462,8 @@ def _create_sagemaker_transform_job(
         else:
             failure_reason = transform_job_info.get(
                 "FailureReason",
-                (
-                    "An unknown SageMaker failure occurred. Please see the SageMaker console logs"
-                    " for more information."
-                ),
+                "An unknown SageMaker failure occurred. Please see the SageMaker console logs"
+                " for more information.",
             )
             return _SageMakerOperationStatus.failed(failure_reason)
 
@@ -1404,9 +1486,14 @@ def _create_sagemaker_endpoint(
     flavor,
     instance_type,
     vpc_config,
+    data_capture_config,
     instance_count,
     role,
     sage_client,
+    variant_name=None,
+    async_inference_config=None,
+    env=None,
+    tags=None,
 ):
     """
     :param endpoint_name: The name of the SageMaker endpoint to create.
@@ -1420,8 +1507,13 @@ def _create_sagemaker_endpoint(
     :param instance_count: The number of SageMaker ML instances on which to deploy the model.
     :param vpc_config: A dictionary specifying the VPC configuration to use when creating the
                        new SageMaker model associated with this SageMaker endpoint.
+    :param data_capture_config: A dictionary specifying the data capture configuration to use when
+                       creating the new SageMaker model associated with this application.
     :param role: SageMaker execution ARN role.
     :param sage_client: A boto3 client for SageMaker.
+    :param variant_name: The name to assign to the new production variant.
+    :param env: A dictionary of environment variables to set for the model.
+    :param tags: A dictionary of tags to apply to the endpoint.
     """
     _logger.info("Creating new endpoint with name: %s ...", endpoint_name)
 
@@ -1434,22 +1526,32 @@ def _create_sagemaker_endpoint(
         image_url=image_url,
         execution_role=role,
         sage_client=sage_client,
+        env=env or {},
+        tags=tags or {},
     )
     _logger.info("Created model with arn: %s", model_response["ModelArn"])
 
+    if not variant_name:
+        variant_name = model_name
+
     production_variant = {
-        "VariantName": model_name,
+        "VariantName": variant_name,
         "ModelName": model_name,
         "InitialInstanceCount": instance_count,
         "InstanceType": instance_type,
         "InitialVariantWeight": 1,
     }
     config_name = _get_sagemaker_config_name(endpoint_name)
-    endpoint_config_response = sage_client.create_endpoint_config(
-        EndpointConfigName=config_name,
-        ProductionVariants=[production_variant],
-        Tags=[{"Key": "app_name", "Value": endpoint_name}],
-    )
+    endpoint_config_kwargs = {
+        "EndpointConfigName": config_name,
+        "ProductionVariants": [production_variant],
+        "Tags": [{"Key": "app_name", "Value": endpoint_name}],
+    }
+    if async_inference_config:
+        endpoint_config_kwargs["AsyncInferenceConfig"] = async_inference_config
+    if data_capture_config is not None:
+        endpoint_config_kwargs["DataCaptureConfig"] = data_capture_config
+    endpoint_config_response = sage_client.create_endpoint_config(**endpoint_config_kwargs)
     _logger.info(
         "Created endpoint configuration with arn: %s", endpoint_config_response["EndpointConfigArn"]
     )
@@ -1471,7 +1573,7 @@ def _create_sagemaker_endpoint(
         if endpoint_status == "Creating":
             return _SageMakerOperationStatus.in_progress(
                 'Waiting for endpoint to reach the "InService" state. Current endpoint status:'
-                ' "{endpoint_status}"'.format(endpoint_status=endpoint_status)
+                f' "{endpoint_status}"'
             )
         elif endpoint_status == "InService":
             return _SageMakerOperationStatus.succeeded(
@@ -1480,10 +1582,8 @@ def _create_sagemaker_endpoint(
         else:
             failure_reason = endpoint_info.get(
                 "FailureReason",
-                (
-                    "An unknown SageMaker failure occurred. Please see the SageMaker console logs"
-                    " for more information."
-                ),
+                "An unknown SageMaker failure occurred. Please see the SageMaker console logs"
+                " for more information.",
             )
             return _SageMakerOperationStatus.failed(failure_reason)
 
@@ -1507,6 +1607,11 @@ def _update_sagemaker_endpoint(
     role,
     sage_client,
     s3_client,
+    variant_name=None,
+    async_inference_config=None,
+    data_capture_config=None,
+    env=None,
+    tags=None,
 ):
     """
     :param endpoint_name: The name of the SageMaker endpoint to update.
@@ -1525,9 +1630,18 @@ def _update_sagemaker_endpoint(
     :param role: SageMaker execution ARN role.
     :param sage_client: A boto3 client for SageMaker.
     :param s3_client: A boto3 client for S3.
+    :param variant_name: The name to assign to the new production variant if it doesn't already exist. # pylint: disable=line-too-long
+    :param async_inference_config: A dictionary specifying the async inference configuration to use.
+                         For more information, see https://docs.aws.amazon.com/sagemaker/latest/APIReference/API_AsyncInferenceConfig.html.
+                         Defaults to ``None``.
+    :param: data_capture_config: A dictionary specifying the data capture configuration to use.
+                                 For more information, see https://docs.aws.amazon.com/sagemaker/latest/APIReference/API_DataCaptureConfig.html.
+                                 Defaults to ``None``.
+    :param env: A dictionary of environment variables to set for the model.
+    :param tags: A dictionary of tags to apply to the endpoint.
     """
     if mode not in [DEPLOYMENT_MODE_ADD, DEPLOYMENT_MODE_REPLACE]:
-        msg = "Invalid mode `{md}` for deployment to a pre-existing application".format(md=mode)
+        msg = f"Invalid mode `{mode}` for deployment to a pre-existing application"
         raise ValueError(msg)
 
     endpoint_info = sage_client.describe_endpoint(EndpointName=endpoint_name)
@@ -1550,8 +1664,13 @@ def _update_sagemaker_endpoint(
         image_url=image_url,
         execution_role=role,
         sage_client=sage_client,
+        env=env or {},
+        tags=tags or {},
     )
     _logger.info("Created new model with arn: %s", new_model_response["ModelArn"])
+
+    if not variant_name:
+        variant_name = model_name
 
     if mode == DEPLOYMENT_MODE_ADD:
         new_model_weight = 0
@@ -1561,7 +1680,7 @@ def _update_sagemaker_endpoint(
         production_variants = []
 
     new_production_variant = {
-        "VariantName": model_name,
+        "VariantName": variant_name,
         "ModelName": model_name,
         "InitialInstanceCount": instance_count,
         "InstanceType": instance_type,
@@ -1572,11 +1691,17 @@ def _update_sagemaker_endpoint(
     # Create the new endpoint configuration and update the endpoint
     # to adopt the new configuration
     new_config_name = _get_sagemaker_config_name(endpoint_name)
-    endpoint_config_response = sage_client.create_endpoint_config(
-        EndpointConfigName=new_config_name,
-        ProductionVariants=production_variants,
-        Tags=[{"Key": "app_name", "Value": endpoint_name}],
-    )
+    # This is the hardcoded config for endpoint
+    endpoint_config_kwargs = {
+        "EndpointConfigName": new_config_name,
+        "ProductionVariants": production_variants,
+        "Tags": [{"Key": "app_name", "Value": endpoint_name}],
+    }
+    if async_inference_config:
+        endpoint_config_kwargs["AsyncInferenceConfig"] = async_inference_config
+    if data_capture_config is not None:
+        endpoint_config_kwargs["DataCaptureConfig"] = data_capture_config
+    endpoint_config_response = sage_client.create_endpoint_config(**endpoint_config_kwargs)
     _logger.info(
         "Created new endpoint configuration with arn: %s",
         endpoint_config_response["EndpointConfigArn"],
@@ -1602,11 +1727,9 @@ def _update_sagemaker_endpoint(
         if endpoint_update_was_rolled_back or endpoint_info["EndpointStatus"] == "Failed":
             failure_reason = endpoint_info.get(
                 "FailureReason",
-                (
-                    "An unknown SageMaker failure occurred."
-                    " Please see the SageMaker console logs for"
-                    " more information."
-                ),
+                "An unknown SageMaker failure occurred."
+                " Please see the SageMaker console logs for"
+                " more information.",
             )
             return _SageMakerOperationStatus.failed(failure_reason)
         elif endpoint_info["EndpointStatus"] == "InService":
@@ -1635,7 +1758,16 @@ def _update_sagemaker_endpoint(
 
 
 def _create_sagemaker_model(
-    model_name, model_s3_path, model_uri, flavor, vpc_config, image_url, execution_role, sage_client
+    model_name,
+    model_s3_path,
+    model_uri,
+    flavor,
+    vpc_config,
+    image_url,
+    execution_role,
+    sage_client,
+    env,
+    tags,
 ):
     """
     :param model_name: The name to assign the new SageMaker model that is created.
@@ -1648,17 +1780,20 @@ def _create_sagemaker_model(
                       model's container,
     :param execution_role: The ARN of the role that SageMaker will assume when creating the model.
     :param sage_client: A boto3 client for SageMaker.
+    :param env: A dictionary of environment variables to set for the model.
+    :param tags: A dictionary of tags to apply to the SageMaker model.
     :return: AWS response containing metadata associated with the new model.
     """
+    tags["model_uri"] = str(model_uri)
     create_model_args = {
         "ModelName": model_name,
         "PrimaryContainer": {
             "Image": image_url,
             "ModelDataUrl": model_s3_path,
-            "Environment": _get_deployment_config(flavor_name=flavor),
+            "Environment": _get_deployment_config(flavor_name=flavor, env_override=env),
         },
         "ExecutionRoleArn": execution_role,
-        "Tags": [{"Key": "model_uri", "Value": str(model_uri)}],
+        "Tags": [{"Key": key, "Value": str(value)} for key, value in tags.items()],
     }
     if vpc_config is not None:
         create_model_args["VpcConfig"] = vpc_config
@@ -1798,7 +1933,7 @@ class SageMakerDeploymentClient(BaseDeploymentClient):
     """
 
     def __init__(self, target_uri):
-        super(SageMakerDeploymentClient, self).__init__(target_uri=target_uri)
+        super().__init__(target_uri=target_uri)
 
         # Default region_name and assumed_role_arn when
         # the target_uri is `sagemaker` or `sagemaker:/`
@@ -1840,19 +1975,24 @@ class SageMakerDeploymentClient(BaseDeploymentClient):
             )
 
     def _default_deployment_config(self, create_mode=True):
-        config = dict(
-            assume_role_arn=self.assumed_role_arn,
-            execution_role_arn=None,
-            bucket=None,
-            image_url=None,
-            region_name=self.region_name,
-            archive=False,
-            instance_type=DEFAULT_SAGEMAKER_INSTANCE_TYPE,
-            instance_count=DEFAULT_SAGEMAKER_INSTANCE_COUNT,
-            vpc_config=None,
-            synchronous=True,
-            timeout_seconds=1200,
-        )
+        config = {
+            "assume_role_arn": self.assumed_role_arn,
+            "execution_role_arn": None,
+            "bucket": None,
+            "image_url": None,
+            "region_name": self.region_name,
+            "archive": False,
+            "instance_type": DEFAULT_SAGEMAKER_INSTANCE_TYPE,
+            "instance_count": DEFAULT_SAGEMAKER_INSTANCE_COUNT,
+            "vpc_config": None,
+            "data_capture_config": None,
+            "synchronous": True,
+            "timeout_seconds": 1200,
+            "variant_name": None,
+            "env": None,
+            "tags": None,
+            "async_inference_config": {},
+        }
 
         if create_mode:
             config["mode"] = DEPLOYMENT_MODE_CREATE
@@ -1862,11 +2002,9 @@ class SageMakerDeploymentClient(BaseDeploymentClient):
         return config
 
     def _apply_custom_config(self, config, custom_config):
-        import json
-
         int_fields = {"instance_count", "timeout_seconds"}
         bool_fields = {"synchronous", "archive"}
-        dict_fields = {"vpc_config"}
+        dict_fields = {"vpc_config", "data_capture_config", "tags", "env", "async_inference_config"}
         for key, value in custom_config.items():
             if key not in config:
                 continue
@@ -1880,8 +2018,7 @@ class SageMakerDeploymentClient(BaseDeploymentClient):
 
             config[key] = value
 
-    @experimental
-    def create_deployment(self, name, model_uri, flavor=None, config=None):
+    def create_deployment(self, name, model_uri, flavor=None, config=None, endpoint=None):
         """
         Deploy an MLflow model on AWS SageMaker.
         The currently active AWS account must have correct permissions set up.
@@ -1909,7 +2046,7 @@ class SageMakerDeploymentClient(BaseDeploymentClient):
                        If ``None``, a flavor is automatically selected from the model's available
                        flavors. If the specified flavor is not present or not supported for
                        deployment, an exception will be thrown.
-        :param config: Configuration paramaters. The supported paramaters are:
+        :param config: Configuration parameters. The supported parameters are:
 
                        - ``assume_role_arn``: The name of an IAM cross-account role to be assumed
                          to deploy SageMaker to another AWS account. If this parameter is not
@@ -1940,29 +2077,6 @@ class SageMakerDeploymentClient(BaseDeploymentClient):
                          If unspecified, use the region name given in the ``target_uri``.
                          If it is also not specified in the ``target_uri``,
                          defaults to ``us-west-2``.
-
-                       - ``mode``: The mode in which to deploy the application.
-                         Must be one of the following:
-
-                         ``mlflow.sagemaker.DEPLOYMENT_MODE_CREATE``
-                             Create a SageMaker endpoint from the given model.
-                             This is the default mode.
-
-                         ``mlflow.sagemaker.DEPLOYMENT_MODE_REPLACE``
-                             If an application of the specified name exists, its model(s) is
-                             replaced with the specified model. If no such application exists,
-                             it is created with the specified name and model.
-
-                         ``mlflow.sagemaker.DEPLOYMENT_MODE_ADD``
-                             Add the specified model to a pre-existing application with the
-                             specified name, if one exists. If the application does not exist,
-                             a new application is created with the specified name and model.
-                             NOTE: If the application **already exists**, the specified model is
-                             added to the application's corresponding SageMaker endpoint with an
-                             initial weight of zero (0). To route traffic to the model,
-                             update the application's associated endpoint configuration using
-                             either the AWS console or the ``UpdateEndpointWeightsAndCapacities``
-                             function defined in https://docs.aws.amazon.com/sagemaker/latest/dg/API_UpdateEndpointWeightsAndCapacities.html.
 
                        - ``archive``: If ``True``, any pre-existing SageMaker application resources
                          that become inactive (i.e. as a result of deploying in
@@ -2006,39 +2120,60 @@ class SageMakerDeploymentClient(BaseDeploymentClient):
                          https://docs.aws.amazon.com/sagemaker/latest/dg/API_VpcConfig.html.
                          Defaults to ``None``.
 
+                       - ``data_capture_config``: A dictionary specifying the data capture
+                         configuration to use when creating the new SageMaker model associated with
+                         this application.
+                         For more information, see
+                         https://docs.aws.amazon.com/sagemaker/latest/APIReference/API_DataCaptureConfig.html.
+                         Defaults to ``None``.
+
+                       - ``variant_name``: A string specifying the desired name when creating a
+                                           production variant.  Defaults to ``None``.
+                       - ``async_inference_config``: A dictionary specifying the async_inference_configuration # pylint: disable=line-too-long
+
+                       - ``env``: A dictionary specifying environment variables as key-value
+                         pairs to be set for the deployed model. Defaults to ``None``.
+
+                       - ``tags``: A dictionary of key-value pairs representing additional
+                         tags to be set for the deployed model. Defaults to ``None``.
+
+        :param endpoint: (optional) Endpoint to create the deployment under. Currently unsupported
+
         .. code-block:: python
             :caption: Python example
 
-            from mlflow.sagemaker import SageMakerDeploymentClient
+            from mlflow.deployments import get_deploy_client
 
             vpc_config = {
-                'SecurityGroupIds': [
-                    'sg-123456abc',
+                "SecurityGroupIds": [
+                    "sg-123456abc",
                 ],
-                'Subnets': [
-                    'subnet-123456abc',
-                ]
+                "Subnets": [
+                    "subnet-123456abc",
+                ],
             }
-            config=dict(
+            config = dict(
                 assume_role_arn="arn:aws:123:role/assumed_role",
                 execution_role_arn="arn:aws:456:role/execution_role",
                 bucket_name="my-s3-bucket",
                 image_url="1234.dkr.ecr.us-east-1.amazonaws.com/mlflow-test:1.23.1",
                 region_name="us-east-1",
-                mode="create",
                 archive=False,
                 instance_type="ml.m5.4xlarge",
                 instance_count=1,
                 synchronous=True,
                 timeout_seconds=300,
-                vpc_config=vpc_config
+                vpc_config=vpc_config,
+                variant_name="prod-variant-1",
+                env={"DISABLE_NGINX": "true", "GUNICORN_CMD_ARGS": '"--timeout 60"'},
+                tags={"training_timestamp": "2022-11-01T05:12:26"},
             )
-            client = SageMakerDeploymentClient("sagemaker")
+            client = get_deploy_client("sagemaker")
             client.create_deployment(
                 "my-deployment",
                 model_uri="/mlruns/0/abc/model",
                 flavor="python_function",
-                config=config
+                config=config,
             )
         .. code-block:: bash
             :caption:  Command-line example
@@ -2051,20 +2186,25 @@ class SageMakerDeploymentClient(BaseDeploymentClient):
                     -C bucket_name=my-s3-bucket \\
                     -C image_url=1234.dkr.ecr.us-east-1.amazonaws.com/mlflow-test:1.23.1 \\
                     -C region_name=us-east-1 \\
-                    -C mode=create \\
                     -C archive=False \\
                     -C instance_type=ml.m5.4xlarge \\
                     -C instance_count=1 \\
                     -C synchronous=True \\
                     -C timeout_seconds=300 \\
+                    -C variant_name=prod-variant-1 \\
                     -C vpc_config='{"SecurityGroupIds": ["sg-123456abc"], \\
-                    "Subnets": ["subnet-123456abc"]}'
+                    "Subnets": ["subnet-123456abc"]}' \\
+                    -C data_capture_config='{"EnableCapture": True, \\
+                    'InitalSamplingPercentage': 100, 'DestinationS3Uri": 's3://my-bucket/path', \\
+                    'CaptureOptions': [{'CaptureMode': 'Output'}]}'
+                    -C env='{"DISABLE_NGINX": "true", "GUNICORN_CMD_ARGS": "\"--timeout 60\""}' \\
+                    -C tags='{"training_timestamp": "2022-11-01T05:12:26"}' \\
         """
         final_config = self._default_deployment_config()
         if config:
             self._apply_custom_config(final_config, config)
 
-        app_name, flavor = deploy(
+        app_name, flavor = _deploy(
             app_name=name,
             model_uri=model_uri,
             flavor=flavor,
@@ -2073,19 +2213,25 @@ class SageMakerDeploymentClient(BaseDeploymentClient):
             bucket=final_config["bucket"],
             image_url=final_config["image_url"],
             region_name=final_config["region_name"],
-            mode=final_config["mode"],
+            mode=mlflow.sagemaker.DEPLOYMENT_MODE_CREATE,
             archive=final_config["archive"],
             instance_type=final_config["instance_type"],
             instance_count=final_config["instance_count"],
             vpc_config=final_config["vpc_config"],
+            data_capture_config=final_config["data_capture_config"],
             synchronous=final_config["synchronous"],
             timeout_seconds=final_config["timeout_seconds"],
+            variant_name=final_config["variant_name"],
+            async_inference_config=final_config["async_inference_config"],
+            env=final_config["env"],
+            tags=final_config["tags"],
         )
 
-        return dict(name=app_name, flavor=flavor)
+        return {"name": app_name, "flavor": flavor}
 
-    @experimental
-    def update_deployment(self, name, model_uri=None, flavor=None, config=None):
+    def update_deployment(
+        self, name, model_uri, flavor=None, config=None, endpoint=None
+    ):  # pylint: disable=signature-differs
         """
         Update a deployment on AWS SageMaker. This function can replace or add a new model to
         an existing SageMaker endpoint. By default, this function replaces the existing model
@@ -2112,7 +2258,7 @@ class SageMakerDeploymentClient(BaseDeploymentClient):
                        flavors. If the specified flavor is not present or not supported for
                        deployment, an exception will be thrown.
 
-        :param config: Configuration paramaters. The supported paramaters are:
+        :param config: Configuration parameters. The supported parameters are:
 
                        - ``assume_role_arn``: The name of an IAM cross-account role to be assumed
                          to deploy SageMaker to another AWS account. If this parameter is not
@@ -2197,6 +2343,9 @@ class SageMakerDeploymentClient(BaseDeploymentClient):
                          ``synchronous`` is ``False``, this parameter is ignored.
                          Defaults to ``300``.
 
+                       - ``variant_name``: A string specifying the desired name when creating a
+                                           production variant.  Defaults to ``None``.
+
                        - ``vpc_config``: A dictionary specifying the VPC configuration to use when
                          creating the new SageMaker model associated with this application.
                          The acceptable values for this parameter are identical to those of the
@@ -2206,20 +2355,46 @@ class SageMakerDeploymentClient(BaseDeploymentClient):
                          https://docs.aws.amazon.com/sagemaker/latest/dg/API_VpcConfig.html.
                          Defaults to ``None``.
 
+                       - ``data_capture_config``: A dictionary specifying the data capture
+                         configuration to use when creating the new SageMaker model associated with
+                         this application.
+                         For more information, see
+                         https://docs.aws.amazon.com/sagemaker/latest/APIReference/API_DataCaptureConfig.html.
+                         Defaults to ``None``.
+
+                       - ``variant_name``: A string specifying the desired name when creating a
+                                           production variant.  Defaults to ``None``.                                           
+                       - ``async_inference_config``: A dictionary specifying the async config 
+                                                     configuration. Defaults to ``None``.
+                       - ``env``: A dictionary specifying environment variables as key-value pairs
+                         to be set for the deployed model. Defaults to ``None``.
+
+                       - ``tags``: A dictionary of key-value pairs representing additional tags
+                         to be set for the deployed model. Defaults to ``None``.
+
+        :param endpoint: (optional) Endpoint containing the deployment to update. Currently
+                         unsupported
+
         .. code-block:: python
             :caption: Python example
 
-            from mlflow.sagemaker import SageMakerDeploymentClient
+            from mlflow.deployments import get_deploy_client
 
             vpc_config = {
-                'SecurityGroupIds': [
-                    'sg-123456abc',
+                "SecurityGroupIds": [
+                    "sg-123456abc",
                 ],
-                'Subnets': [
-                    'subnet-123456abc',
-                ]
+                "Subnets": [
+                    "subnet-123456abc",
+                ],
             }
-            config=dict(
+            data_capture_config = {
+                "EnableCapture": True,
+                "InitalSamplingPercentage": 100,
+                "DestinationS3Uri": "s3://my-bucket/path",
+                "CaptureOptions": [{"CaptureMode": "Output"}],
+            }
+            config = dict(
                 assume_role_arn="arn:aws:123:role/assumed_role",
                 execution_role_arn="arn:aws:456:role/execution_role",
                 bucket_name="my-s3-bucket",
@@ -2231,14 +2406,18 @@ class SageMakerDeploymentClient(BaseDeploymentClient):
                 instance_count=1,
                 synchronous=True,
                 timeout_seconds=300,
-                vpc_config=vpc_config
+                variant_name="prod-variant-1",
+                vpc_config=vpc_config,
+                data_capture_config=data_capture_config,
+                env={"DISABLE_NGINX": "true", "GUNICORN_CMD_ARGS": '"--timeout 60"'},
+                tags={"training_timestamp": "2022-11-01T05:12:26"},
             )
-            client = SageMakerDeploymentClient("sagemaker")
+            client = get_deploy_client("sagemaker")
             client.update_deployment(
                 "my-deployment",
                 model_uri="/mlruns/0/abc/model",
                 flavor="python_function",
-                config=config
+                config=config,
             )
         .. code-block:: bash
             :caption:  Command-line example
@@ -2257,8 +2436,14 @@ class SageMakerDeploymentClient(BaseDeploymentClient):
                     -C instance_count=1 \\
                     -C synchronous=True \\
                     -C timeout_seconds=300 \\
+                    -C variant_name=prod-variant-1 \\
                     -C vpc_config='{"SecurityGroupIds": ["sg-123456abc"], \\
-                    "Subnets": ["subnet-123456abc"]}'
+                    "Subnets": ["subnet-123456abc"]}' \\
+                    -C data_capture_config='{"EnableCapture": True, \\
+                    "InitalSamplingPercentage": 100, "DestinationS3Uri": "s3://my-bucket/path", \\
+                    "CaptureOptions": [{"CaptureMode": "Output"}]}'
+                    -C env='{"DISABLE_NGINX": "true", "GUNICORN_CMD_ARGS": "\"--timeout 60\""}' \\
+                    -C tags='{"training_timestamp": "2022-11-01T05:12:26"}' \\
         """
         final_config = self._default_deployment_config(create_mode=False)
         if config:
@@ -2266,18 +2451,20 @@ class SageMakerDeploymentClient(BaseDeploymentClient):
 
         if model_uri is None:
             raise MlflowException(
-                message=("A model_uri must be provided when updating a SageMaker deployment"),
+                message="A model_uri must be provided when updating a SageMaker deployment",
                 error_code=INVALID_PARAMETER_VALUE,
             )
 
         if final_config["mode"] not in [DEPLOYMENT_MODE_ADD, DEPLOYMENT_MODE_REPLACE]:
             raise MlflowException(
-                message=f"Invalid mode `{final_config['mode']}` for deployment \
-                        to a pre-existing application",
+                message=(
+                    f"Invalid mode `{final_config['mode']}` for deployment"
+                    " to a pre-existing application"
+                ),
                 error_code=INVALID_PARAMETER_VALUE,
             )
 
-        app_name, flavor = deploy(
+        app_name, flavor = _deploy(
             app_name=name,
             model_uri=model_uri,
             flavor=flavor,
@@ -2291,19 +2478,23 @@ class SageMakerDeploymentClient(BaseDeploymentClient):
             instance_type=final_config["instance_type"],
             instance_count=final_config["instance_count"],
             vpc_config=final_config["vpc_config"],
+            data_capture_config=final_config["data_capture_config"],
             synchronous=final_config["synchronous"],
             timeout_seconds=final_config["timeout_seconds"],
+            variant_name=final_config["variant_name"],
+            async_inference_config=final_config["async_inference_config"],
+            env=final_config["env"],
+            tags=final_config["tags"],
         )
 
-        return dict(name=app_name, flavor=flavor)
+        return {"name": app_name, "flavor": flavor}
 
-    @experimental
-    def delete_deployment(self, name, config=None):
+    def delete_deployment(self, name, config=None, endpoint=None):
         """
         Delete a SageMaker application.
 
         :param name: Name of the deployed application.
-        :param config: Configuration paramaters. The supported paramaters are:
+        :param config: Configuration parameters. The supported parameters are:
 
                        - ``assume_role_arn``: The name of an IAM role to be assumed to delete
                          the SageMaker deployment.
@@ -2331,20 +2522,22 @@ class SageMakerDeploymentClient(BaseDeploymentClient):
                          is responsible for monitoring the status of the deletion process via native
                          SageMaker APIs or the AWS console. If `synchronous` is False, this
                          parameter is ignored. Defaults to ``300``.
+        :param endpoint: (optional) Endpoint containing the deployment to delete. Currently
+                         unsupported
 
         .. code-block:: python
             :caption: Python example
 
-            from mlflow.sagemaker import SageMakerDeploymentClient
+            from mlflow.deployments import get_deploy_client
 
             config = dict(
                 assume_role_arn="arn:aws:123:role/assumed_role",
                 region_name="us-east-1",
                 archive=False,
                 synchronous=True,
-                timeout_seconds=300
+                timeout_seconds=300,
             )
-            client = SageMakerDeploymentClient("sagemaker")
+            client = get_deploy_client("sagemaker")
             client.delete_deployment("my-deployment", config=config)
 
         .. code-block:: bash
@@ -2358,17 +2551,17 @@ class SageMakerDeploymentClient(BaseDeploymentClient):
                     -C synchronous=True \\
                     -C timeout_seconds=300
         """
-        final_config = dict(
-            region_name=self.region_name,
-            archive=False,
-            synchronous=True,
-            timeout_seconds=300,
-            assume_role_arn=self.assumed_role_arn,
-        )
+        final_config = {
+            "region_name": self.region_name,
+            "archive": False,
+            "synchronous": True,
+            "timeout_seconds": 300,
+            "assume_role_arn": self.assumed_role_arn,
+        }
         if config:
             self._apply_custom_config(final_config, config)
 
-        delete(
+        _delete(
             name,
             region_name=final_config["region_name"],
             assume_role_arn=final_config["assume_role_arn"],
@@ -2377,7 +2570,7 @@ class SageMakerDeploymentClient(BaseDeploymentClient):
             timeout_seconds=final_config["timeout_seconds"],
         )
 
-    def list_deployments(self):
+    def list_deployments(self, endpoint=None):
         """
         List deployments. This method returns a list of dictionaries that describes each deployment.
 
@@ -2388,14 +2581,17 @@ class SageMakerDeploymentClient(BaseDeploymentClient):
         with the AWS region and the role ARN in the ``target_uri`` such as
         ``sagemaker:/us-east-1/arn:aws:1234:role/assumed_role``.
 
+        :param endpoint: (optional) List deployments in the specified endpoint. Currently
+                         unsupported
+
         :return: A list of dictionaries corresponding to deployments.
 
         .. code-block:: python
             :caption: Python example
 
-            from mlflow.sagemaker import SageMakerDeploymentClient
+            from mlflow.deployments import get_deploy_client
 
-            client = SageMakerDeploymentClient("sagemaker:/us-east-1/arn:aws:123:role/assumed_role")
+            client = get_deploy_client("sagemaker:/us-east-1/arn:aws:123:role/assumed_role")
             client.list_deployments()
 
         .. code-block:: bash
@@ -2414,7 +2610,7 @@ class SageMakerDeploymentClient(BaseDeploymentClient):
         )
         return sage_client.list_endpoints()["Endpoints"]
 
-    def get_deployment(self, name):
+    def get_deployment(self, name, endpoint=None):
         """
         Returns a dictionary describing the specified deployment.
 
@@ -2429,14 +2625,16 @@ class SageMakerDeploymentClient(BaseDeploymentClient):
         while retrieving the deployment.
 
         :param name: Name of deployment to retrieve
+        :param endpoint: (optional) Endpoint containing the deployment to get. Currently
+                         unsupported
         :return: A dictionary that describes the specified deployment
 
         .. code-block:: python
             :caption: Python example
 
-            from mlflow.sagemaker import SageMakerDeploymentClient
+            from mlflow.deployments import get_deploy_client
 
-            client = SageMakerDeploymentClient("sagemaker:/us-east-1/arn:aws:123:role/assumed_role")
+            client = get_deploy_client("sagemaker:/us-east-1/arn:aws:123:role/assumed_role")
             client.get_deployment("my-deployment")
 
         .. code-block:: bash
@@ -2458,10 +2656,10 @@ class SageMakerDeploymentClient(BaseDeploymentClient):
             return sage_client.describe_endpoint(EndpointName=name)
         except Exception as exc:
             raise MlflowException(
-                message=(f"There was an error while retrieving the deployment: {exc}\n")
+                message=f"There was an error while retrieving the deployment: {exc}\n"
             )
 
-    def predict(self, deployment_name, df):
+    def predict(self, deployment_name=None, inputs=None, endpoint=None):
         """
         Compute predictions from the specified deployment using the provided PyFunc input.
 
@@ -2476,8 +2674,10 @@ class SageMakerDeploymentClient(BaseDeploymentClient):
         ``sagemaker:/us-east-1/arn:aws:1234:role/assumed_role``.
 
         :param deployment_name: Name of the deployment to predict against.
-        :param df: A PyFunc input, such as a Pandas DataFrame, NumPy array, list, or dictionary.
-                   For a complete list of supported input types, see :ref:`pyfunc-inference-api`.
+        :param inputs: Input data (or arguments) to pass to the deployment or model endpoint for
+                       inference. For a complete list of supported input types, see
+                       :ref:`pyfunc-inference-api`.
+        :param endpoint: Endpoint to predict against. Currently unsupported
         :return: A PyFunc output, such as a Pandas DataFrame, Pandas Series, or NumPy array.
                  For a complete list of supported output types, see :ref:`pyfunc-inference-api`.
 
@@ -2485,10 +2685,10 @@ class SageMakerDeploymentClient(BaseDeploymentClient):
             :caption: Python example
 
             import pandas as pd
-            from mlflow.sagemaker import SageMakerDeploymentClient
+            from mlflow.deployments import get_deploy_client
 
             df = pd.DataFrame(data=[[1, 2, 3]], columns=["feat1", "feat2", "feat3"])
-            client = SageMakerDeploymentClient("sagemaker:/us-east-1/arn:aws:123:role/assumed_role")
+            client = get_deploy_client("sagemaker:/us-east-1/arn:aws:123:role/assumed_role")
             client.predict("my-deployment", df)
 
         .. code-block:: bash
@@ -2503,10 +2703,7 @@ class SageMakerDeploymentClient(BaseDeploymentClient):
                 --name my-deployment \\
                 --input-path ./input.json
         """
-        import json
         import boto3
-        from mlflow.pyfunc.scoring_server import infer_and_parse_json_input
-        from mlflow.utils.proto_json_utils import _get_jsonable_obj
 
         assume_role_credentials = _assume_role_and_get_credentials(
             assume_role_arn=self.assumed_role_arn
@@ -2518,20 +2715,88 @@ class SageMakerDeploymentClient(BaseDeploymentClient):
             )
             response = sage_client.invoke_endpoint(
                 EndpointName=deployment_name,
-                Body=json.dumps(_get_jsonable_obj(df, pandas_orient="split")),
+                Body=dump_input_data(inputs, inputs_key="instances"),
                 ContentType="application/json",
             )
-
             response_body = response["Body"].read().decode("utf-8")
-            return infer_and_parse_json_input(response_body)
+            return PredictionsResponse.from_json(response_body)
         except Exception as exc:
             raise MlflowException(
-                message=(f"There was an error while getting model prediction: {exc}\n")
+                message=f"There was an error while getting model prediction: {exc}\n"
             )
 
-    def explain(self, deployment_name, df):
+    def explain(self, deployment_name=None, df=None, endpoint=None):
         """
         *This function has not been implemented and will be coming in the future.*
+        """
+        raise NotImplementedError("This function is not implemented yet.")
+
+    def create_endpoint(self, name, config=None):
+        """
+        Create an endpoint with the specified target. By default, this method should block until
+        creation completes (i.e. until it's possible to create a deployment within the endpoint).
+        In the case of conflicts (e.g. if it's not possible to create the specified endpoint
+        due to conflict with an existing endpoint), raises a
+        :py:class:`mlflow.exceptions.MlflowException`. See target-specific plugin documentation
+        for additional detail on support for asynchronous creation and other configuration.
+
+        :param name: Unique name to use for endpoint. If another endpoint exists with the same
+                     name, raises a :py:class:`mlflow.exceptions.MlflowException`.
+        :param config: (optional) Dict containing target-specific configuration for the
+                       endpoint.
+        :return: Dict corresponding to created endpoint, which must contain the 'name' key.
+        """
+        raise NotImplementedError("This function is not implemented yet.")
+
+    def update_endpoint(self, endpoint, config=None):
+        """
+        Update the endpoint with the specified name. You can update any target-specific attributes
+        of the endpoint (via `config`). By default, this method should block until the update
+        completes (i.e. until it's possible to create a deployment within the endpoint). See
+        target-specific plugin documentation for additional detail on support for asynchronous
+        update and other configuration.
+
+        :param endpoint: Unique name of endpoint to update
+        :param config: (optional) dict containing target-specific configuration for the
+                       endpoint
+        :return: None
+        """
+        raise NotImplementedError("This function is not implemented yet.")
+
+    def delete_endpoint(self, endpoint):
+        """
+        Delete the endpoint from the specified target. Deletion should be idempotent (i.e. deletion
+        should not fail if retried on a non-existent deployment).
+
+        :param endpoint: Name of endpoint to delete
+        :return: None
+        """
+        raise NotImplementedError("This function is not implemented yet.")
+
+    def list_endpoints(self):
+        """
+        List endpoints in the specified target. This method is expected to return an
+        unpaginated list of all endpoints (an alternative would be to return a dict with
+        an 'endpoints' field containing the actual endpoints, with plugins able to specify
+        other fields, e.g. a next_page_token field, in the returned dictionary for pagination,
+        and to accept a `pagination_args` argument to this method for passing
+        pagination-related args).
+
+        :return: A list of dicts corresponding to endpoints. Each dict is guaranteed to
+                 contain a 'name' key containing the endpoint name. The other fields of
+                 the returned dictionary and their types may vary across targets.
+        """
+        raise NotImplementedError("This function is not implemented yet.")
+
+    def get_endpoint(self, endpoint):
+        """
+        Returns a dictionary describing the specified endpoint, throwing a
+        py:class:`mlflow.exception.MlflowException` if no endpoint exists with the provided
+        name.
+        The dict is guaranteed to contain an 'name' key containing the endpoint name.
+        The other fields of the returned dictionary and their types may vary across targets.
+
+        :param endpoint: Name of endpoint to fetch
         """
         raise NotImplementedError("This function is not implemented yet.")
 
@@ -2580,7 +2845,6 @@ class _SageMakerOperation:
 
 
 class _SageMakerOperationStatus:
-
     STATE_SUCCEEDED = "succeeded"
     STATE_FAILED = "failed"
     STATE_IN_PROGRESS = "in progress"
@@ -2600,9 +2864,9 @@ class _SageMakerOperationStatus:
     def timed_out(cls, duration_seconds):
         return cls(
             _SageMakerOperationStatus.STATE_TIMED_OUT,
-            "Timed out after waiting {duration_seconds} seconds for the operation to"
+            f"Timed out after waiting {duration_seconds} seconds for the operation to"
             " complete. This operation may still be in progress. Please check the AWS"
-            " console for more information.".format(duration_seconds=duration_seconds),
+            " console for more information.",
         )
 
     @classmethod

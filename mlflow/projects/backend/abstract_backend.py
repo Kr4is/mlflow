@@ -1,6 +1,8 @@
 from abc import abstractmethod, ABCMeta
+from mlflow.utils.annotations import developer_stable
 
 
+@developer_stable
 class AbstractBackend:
     """
     Abstract plugin class defining the interface needed to execute MLflow projects. You can define
@@ -14,7 +16,14 @@ class AbstractBackend:
 
     @abstractmethod
     def run(
-        self, project_uri, entry_point, params, version, backend_config, tracking_uri, experiment_id
+        self,
+        project_uri,
+        entry_point,
+        params,
+        version,
+        backend_config,
+        tracking_uri,
+        experiment_id,
     ):
         """
         Submit an entrypoint. It must return a SubmittedRun object to track the execution

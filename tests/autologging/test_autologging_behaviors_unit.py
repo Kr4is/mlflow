@@ -17,9 +17,6 @@ from tests.autologging.fixtures import test_mode_off, patch_destination
 from tests.autologging.fixtures import reset_stderr  # pylint: disable=unused-import
 
 
-pytestmark = pytest.mark.large
-
-
 @pytest.fixture
 def logger():
     return logging.getLogger(mlflow.__name__)
@@ -94,8 +91,8 @@ def test_autologging_warnings_are_redirected_as_expected(
     # Accordingly, we expect the following warnings to have been emitted normally: 1. MLflow
     # warnings emitted during autologging enablement, 2. non-MLflow warnings emitted during original
     # / underlying function execution
-    warning_messages = set([str(w.message) for w in warnings_record])
-    assert warning_messages == set(["enablement warning MLflow", "Test warning from OG function"])
+    warning_messages = {str(w.message) for w in warnings_record}
+    assert warning_messages == {"enablement warning MLflow", "Test warning from OG function"}
 
     # Further, We expect MLflow's logging stream to contain content from all warnings emitted during
     # the autologging preamble and postamble and non-MLflow warnings emitted during autologging
@@ -104,13 +101,13 @@ def test_autologging_warnings_are_redirected_as_expected(
         'MLflow autologging encountered a warning: "%s:5: Warning: preamble MLflow warning"',
         'MLflow autologging encountered a warning: "%s:10: Warning: postamble MLflow warning"',
     ]:
-        assert (item % mlflow.__file__) in stream.getvalue()
+        assert item % mlflow.__file__ in stream.getvalue()
     for item in [
         'MLflow autologging encountered a warning: "%s:7: UserWarning: preamble numpy warning"',
         'MLflow autologging encountered a warning: "%s:14: Warning: postamble numpy warning"',
         'MLflow autologging encountered a warning: "%s:30: Warning: enablement warning numpy"',
     ]:
-        assert (item % np.__file__) in stream.getvalue()
+        assert item % np.__file__ in stream.getvalue()
 
 
 def test_autologging_event_logging_and_warnings_respect_silent_mode(
@@ -148,7 +145,7 @@ def test_autologging_event_logging_and_warnings_respect_silent_mode(
     for item in ["patch1", "patch2", "patch3", "patch4"]:
         assert item in stream.getvalue()
 
-    warning_messages = set([str(w.message) for w in noisy_warnings_record])
+    warning_messages = {str(w.message) for w in noisy_warnings_record}
     assert "enablement warning MLflow" in warning_messages
 
     # Verify that `warnings.showwarning` was restored to its original value after training

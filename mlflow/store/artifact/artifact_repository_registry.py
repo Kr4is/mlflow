@@ -14,7 +14,6 @@ from mlflow.store.artifact.s3_artifact_repo import S3ArtifactRepository
 from mlflow.store.artifact.sftp_artifact_repo import SFTPArtifactRepository
 from mlflow.store.artifact.http_artifact_repo import HttpArtifactRepository
 from mlflow.store.artifact.mlflow_artifacts_repo import MlflowArtifactsRepository
-
 from mlflow.utils.uri import get_uri_scheme
 
 
@@ -72,6 +71,14 @@ class ArtifactRepositoryRegistry:
             )
         return repository(artifact_uri)
 
+    def get_registered_artifact_repositories(self):
+        """
+        Get all registered artifact repositories.
+
+        :return: A dictionary mapping string artifact URI schemes to artifact repositories.
+        """
+        return self._registry
+
 
 _artifact_repository_registry = ArtifactRepositoryRegistry()
 
@@ -105,3 +112,12 @@ def get_artifact_repository(artifact_uri):
              requirements.
     """
     return _artifact_repository_registry.get_artifact_repository(artifact_uri)
+
+
+def get_registered_artifact_repositories():
+    """
+    Get all registered artifact repositories.
+
+    :return: A dictionary mapping string artifact URI schemes to artifact repositories.
+    """
+    return _artifact_repository_registry.get_registered_artifact_repositories()

@@ -2,9 +2,10 @@ name: Test package build
 
 on:
   push:
-    branches: [master]
+    branches:
+      - master
+      - branch-[0-9]+.[0-9]+
   pull_request:
-    branches: [master]
   workflow_dispatch:
     inputs:
       repository:
@@ -22,7 +23,7 @@ on:
         default: ""
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/master' && github.run_number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
 defaults:
@@ -32,36 +33,42 @@ defaults:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     strategy:
       matrix:
         type: ["full", "skinny"]
     steps:
       - uses: actions/checkout@v3
         with:
+          submodules: recursive
           repository: ${{ github.event.inputs.repository }}
           ref: ${{ github.event.inputs.ref }}
-      - uses: actions/setup-node@v1
-        with:
-          node-version: "16"
-      - uses: actions/setup-python@v3
-        with:
-          python-version: "3.7"
-
+      - uses: ./.github/actions/setup-python
       - name: Set environment variable for skinny client build
         if: ${{ matrix.type == 'skinny' }}
         run: |
           echo "MLFLOW_SKINNY=true" >> $GITHUB_ENV
 
-      - name: Build UI
-        if: ${{ matrix.type == 'full' }}
-        working-directory: mlflow/server/js
-        env:
-          # Prevent warnings (emitted from react-pdf) from being treated as errors
-          # https://github.com/wojtekmaj/react-pdf/issues/280
-          CI: false
+      - name: Create dummy MLflow UI
         run: |
-          yarn install
-          yarn run build
+          mkdir -p mlflow/server/js/build
+          echo '
+          <!DOCTYPE html>
+          <html lang="en">
+            <head>
+              <meta charset="utf-8">
+              <title>MLflow</title>
+            </head>
+          <body>
+            MLflow
+          </body>
+          </html>
+          ' > mlflow/server/js/build/index.html
+
+      - name: Check dependencies consistency
+        run: |
+          pip install pyyaml
+          ./dev/validate-requirements-consistency.sh
 
       - name: Install dependencies
         run: |
@@ -81,10 +88,10 @@ jobs:
           wheel_path=$(find dist -type f -name "*.whl")
           wheel_name=$(basename $wheel_path)
           wheel_size=$(stat -c %s $wheel_path)
-          echo "::set-output name=sdist-path::${sdist_path}"
-          echo "::set-output name=wheel-path::${wheel_path}"
-          echo "::set-output name=wheel-name::${wheel_name}"
-          echo "::set-output name=wheel-size::${wheel_size}"
+          echo "sdist-path=${sdist_path}" >> $GITHUB_OUTPUT
+          echo "wheel-path=${wheel_path}" >> $GITHUB_OUTPUT
+          echo "wheel-name=${wheel_name}" >> $GITHUB_OUTPUT
+          echo "wheel-size=${wheel_size}" >> $GITHUB_OUTPUT
 
       - name: Run twine check
         run: |
@@ -109,7 +116,7 @@ jobs:
           path: ${{ steps.build-dist.outputs.wheel-path }}
 
       - name: Remove old wheels
-        uses: actions/github-script@v3
+        uses: actions/github-script@v6
         if: github.event_name == 'push'
         env:
           WHEEL_SIZE: ${{ steps.build-dist.outputs.wheel-size }}
@@ -119,7 +126,7 @@ jobs:
             const { owner, repo } = context.repo;
 
             // For some reason, the newly-uploaded wheel in the previous step is not included.
-            const artifactsResp = await github.actions.listArtifactsForRepo({
+            const artifactsResp = await github.rest.actions.listArtifactsForRepo({
               owner,
               repo,
             });
@@ -145,7 +152,7 @@ jobs:
 
             // Delete old wheels
             const promises = wheels.slice(index).map(({ id: artifact_id }) =>
-              github.actions.deleteArtifact({
+              github.rest.actions.deleteArtifact({
                 owner,
                 repo,
                 artifact_id,

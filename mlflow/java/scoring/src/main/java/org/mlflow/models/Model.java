@@ -1,6 +1,7 @@
 package org.mlflow.models;
 
 import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.io.File;
 import java.io.IOException;
@@ -47,6 +48,12 @@ public class Model {
 
   @JsonProperty("mlflow_version")
   private String mlflowVersion;
+
+  @JsonProperty("databricks_runtime")
+  private String databricksRuntime;
+
+  @JsonProperty("metadata")
+  private JsonNode metadata;
 
   private String rootPath;
 
@@ -98,6 +105,21 @@ public class Model {
   /** @return The version of MLflow with which the model was saved */
   public Optional<String> getMlflowVersion() {
     return Optional.ofNullable(this.mlflowVersion);
+  }
+
+  /**
+   * @return If the model was trained on Databricks, the version the Databricks Runtime
+   * that was used to train the model
+   */
+  public Optional<String> getDatabricksRuntime() {
+    return Optional.ofNullable(this.databricksRuntime);
+  }
+
+  /**
+   * @return The user defined metadata added to the model
+   */
+  public Optional<JsonNode> getMetadata() {
+    return Optional.ofNullable(this.metadata);
   }
 
   /** @return The path to the root directory of the MLflow model */

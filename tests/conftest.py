@@ -7,38 +7,27 @@ from unittest import mock
 import pytest
 
 import mlflow
+from mlflow.tracking._tracking_service.utils import _use_tracking_uri
 from mlflow.utils.file_utils import path_to_local_sqlite_uri
+from mlflow.utils.os import is_windows
 
 from tests.autologging.fixtures import enable_test_mode
 
 
-@pytest.fixture
-def reset_mock():
-    cache = []
-
-    def set_mock(obj, attr, mock):
-        cache.append((obj, attr, getattr(obj, attr)))
-        setattr(obj, attr, mock)
-
-    yield set_mock
-
-    for obj, attr, value in cache:
-        setattr(obj, attr, value)
-    cache[:] = []
+@pytest.fixture(autouse=True)
+def tracking_uri_mock(tmp_path, request):
+    if "notrackingurimock" not in request.keywords:
+        tracking_uri = path_to_local_sqlite_uri(os.path.join(tmp_path, "mlruns.sqlite"))
+        with _use_tracking_uri(tracking_uri):
+            yield tracking_uri
+    else:
+        yield None
 
 
 @pytest.fixture(autouse=True)
-def tracking_uri_mock(tmpdir, request):
-    try:
-        if "notrackingurimock" not in request.keywords:
-            tracking_uri = path_to_local_sqlite_uri(os.path.join(tmpdir.strpath, "mlruns.sqlite"))
-            mlflow.set_tracking_uri(tracking_uri)
-            os.environ["MLFLOW_TRACKING_URI"] = tracking_uri
-        yield tmpdir
-    finally:
-        mlflow.set_tracking_uri(None)
-        if "notrackingurimock" not in request.keywords:
-            del os.environ["MLFLOW_TRACKING_URI"]
+def reset_active_experiment_id():
+    yield
+    mlflow.tracking.fluent._active_experiment_id = None
 
 
 @pytest.fixture(autouse=True, scope="session")
@@ -100,8 +89,8 @@ def prevent_infer_pip_requirements_fallback(request):
         yield
 
 
-@pytest.fixture(autouse=True, scope="module")
-def clean_up_mlruns_direcotry(request):
+@pytest.fixture(autouse=True)
+def clean_up_mlruns_directory(request):
     """
     Clean up an `mlruns` directory on each test module teardown on CI to save the disk space.
     """
@@ -115,8 +104,50 @@ def clean_up_mlruns_direcotry(request):
     if os.path.exists(mlruns_dir):
         try:
             shutil.rmtree(mlruns_dir)
-        except IOError:
+        except OSError:
             if os.name == "nt":
                 raise
             # `shutil.rmtree` can't remove files owned by root in a docker container.
             subprocess.run(["sudo", "rm", "-rf", mlruns_dir], check=True)
+
+
+@pytest.fixture
+def mock_s3_bucket():
+    """
+    Creates a mock S3 bucket using moto
+
+    :return: The name of the mock bucket
+    """
+    import boto3
+    import moto
+
+    with moto.mock_s3():
+        bucket_name = "mock-bucket"
+        s3_client = boto3.client("s3")
+        s3_client.create_bucket(Bucket=bucket_name)
+        yield bucket_name
+
+
+class ExtendedMonkeyPatch(pytest.MonkeyPatch):  # type: ignore
+    def setenvs(self, envs, prepend=None):
+        for name, value in envs.items():
+            self.setenv(name, value, prepend)
+
+    def delenvs(self, names, raising=True):
+        for name in names:
+            self.delenv(name, raising)
+
+
+@pytest.fixture
+def monkeypatch():
+    """
+    Overrides the default monkeypatch fixture to use `ExtendedMonkeyPatch`.
+    """
+    with ExtendedMonkeyPatch().context() as mp:
+        yield mp
+
+
+@pytest.fixture
+def tmp_sqlite_uri(tmp_path):
+    path = tmp_path.joinpath("mlflow.db").as_uri()
+    return ("sqlite://" if is_windows() else "sqlite:////") + path[len("file://") :]

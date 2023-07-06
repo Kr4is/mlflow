@@ -1,36 +1,38 @@
 import os
-import pathlib
+from pathlib import Path
 import pytest
 from unittest import mock
 
 import pmdarima
 import numpy as np
 import pandas as pd
+import json
 import yaml
 
 import mlflow.pmdarima
 from mlflow import pyfunc
 from mlflow.exceptions import MlflowException
-from mlflow.models import infer_signature, Model
+from mlflow.models import infer_signature, Model, ModelSignature
 from mlflow.models.utils import _read_example
 import mlflow.pyfunc.scoring_server as pyfunc_scoring_server
 from mlflow.store.artifact.s3_artifact_repo import S3ArtifactRepository
 from mlflow.tracking.artifact_utils import _download_artifact_from_uri
 from mlflow.tracking._model_registry import DEFAULT_AWAIT_MAX_SLEEP_SECONDS
+from mlflow.types import DataType
+from mlflow.types.schema import Schema, ColSpec
 from mlflow.utils.environment import _mlflow_conda_env
 from mlflow.utils.model_utils import _get_flavor_configuration
 from tests.prophet.test_prophet_model_export import DataGeneration
 
-from tests.helper_functions import mock_s3_bucket  # pylint: disable=unused-import
 from tests.helper_functions import (
     _compare_conda_env_requirements,
     _assert_pip_requirements,
     pyfunc_serve_and_score_model,
     _is_available_on_pypi,
     _compare_logged_code_paths,
+    _mlflow_major_version_string,
 )
 
-pytestmark = pytest.mark.large
 
 EXTRA_PYFUNC_SERVING_TEST_ARGS = (
     [] if _is_available_on_pypi("pmdarima") else ["--env-manager", "local"]
@@ -51,7 +53,6 @@ def pmdarima_custom_env(tmp_path):
 
 @pytest.fixture(scope="module")
 def test_data():
-
     data_conf = {
         "shift": False,
         "start": "2016-01-01",
@@ -67,7 +68,6 @@ def test_data():
 
 @pytest.fixture(scope="module")
 def auto_arima_model(test_data):
-
     return pmdarima.auto_arima(
         test_data["orders"], max_d=1, suppress_warnings=True, error_action="raise"
     )
@@ -75,13 +75,11 @@ def auto_arima_model(test_data):
 
 @pytest.fixture(scope="module")
 def auto_arima_object_model(test_data):
-
     model = pmdarima.arima.ARIMA(order=(2, 1, 3), maxiter=25)
     return model.fit(test_data["orders"])
 
 
 def test_pmdarima_auto_arima_save_and_load(auto_arima_model, model_path):
-
     mlflow.pmdarima.save_model(pmdarima_model=auto_arima_model, path=model_path)
 
     loaded_model = mlflow.pmdarima.load_model(model_uri=model_path)
@@ -90,7 +88,6 @@ def test_pmdarima_auto_arima_save_and_load(auto_arima_model, model_path):
 
 
 def test_pmdarima_arima_object_save_and_load(auto_arima_object_model, model_path):
-
     mlflow.pmdarima.save_model(pmdarima_model=auto_arima_object_model, path=model_path)
 
     loaded_model = mlflow.pmdarima.load_model(model_uri=model_path)
@@ -99,7 +96,6 @@ def test_pmdarima_arima_object_save_and_load(auto_arima_object_model, model_path
 
 
 def test_pmdarima_autoarima_pyfunc_save_and_load(auto_arima_model, model_path):
-
     mlflow.pmdarima.save_model(pmdarima_model=auto_arima_model, path=model_path)
     loaded_pyfunc = mlflow.pyfunc.load_model(model_uri=model_path)
 
@@ -117,18 +113,21 @@ def test_pmdarima_autoarima_pyfunc_save_and_load(auto_arima_model, model_path):
 @pytest.mark.parametrize("use_signature", [True, False])
 @pytest.mark.parametrize("use_example", [True, False])
 def test_pmdarima_signature_and_examples_saved_correctly(
-    auto_arima_model, test_data, model_path, use_signature, use_example
+    auto_arima_model, model_path, use_signature, use_example
 ):
-
     # NB: Signature inference will only work on the first element of the tuple return
     prediction = auto_arima_model.predict(n_periods=20, return_conf_int=True, alpha=0.05)
-    signature = infer_signature(test_data, prediction[0]) if use_signature else None
-    example = test_data[0:5].copy(deep=False) if use_example else None
+    test_data = pd.DataFrame({"n_periods": [30]})
+    signature = infer_signature(test_data, prediction[0]) if use_signature or use_example else None
+    example = test_data if use_example else None
     mlflow.pmdarima.save_model(
         auto_arima_model, path=model_path, signature=signature, input_example=example
     )
     mlflow_model = Model.load(model_path)
-    assert signature == mlflow_model.signature
+    if signature is None and example is None:
+        assert mlflow_model.signature is None
+    else:
+        assert mlflow_model.signature == signature
     if example is None:
         assert mlflow_model.saved_input_example_info is None
     else:
@@ -139,7 +138,7 @@ def test_pmdarima_signature_and_examples_saved_correctly(
 @pytest.mark.parametrize("use_signature", [True, False])
 @pytest.mark.parametrize("use_example", [True, False])
 def test_pmdarima_signature_and_example_for_confidence_interval_mode(
-    auto_arima_model, model_path, test_data, use_signature, use_example
+    auto_arima_model, model_path, use_signature, use_example
 ):
     model_path_primary = model_path.joinpath("primary")
     model_path_secondary = model_path.joinpath("secondary")
@@ -147,13 +146,17 @@ def test_pmdarima_signature_and_example_for_confidence_interval_mode(
     loaded_pyfunc = mlflow.pyfunc.load_model(model_uri=model_path_primary)
     predict_conf = pd.DataFrame([{"n_periods": 10, "return_conf_int": True, "alpha": 0.2}])
     forecast = loaded_pyfunc.predict(predict_conf)
-    signature = infer_signature(test_data["orders"], forecast) if use_signature else None
-    example = test_data[0:10].copy(deep=False) if use_example else None
+    signature_ = infer_signature(predict_conf, forecast)
+    signature = signature_ if use_signature else None
+    example = predict_conf.copy(deep=False) if use_example else None
     mlflow.pmdarima.save_model(
         auto_arima_model, path=model_path_secondary, signature=signature, input_example=example
     )
     mlflow_model = Model.load(model_path_secondary)
-    assert signature == mlflow_model.signature
+    if signature is None and example is None:
+        assert mlflow_model.signature is None
+    else:
+        assert mlflow_model.signature == signature_
     if example is None:
         assert mlflow_model.saved_input_example_info is None
     else:
@@ -164,7 +167,6 @@ def test_pmdarima_signature_and_example_for_confidence_interval_mode(
 def test_pmdarima_load_from_remote_uri_succeeds(
     auto_arima_object_model, model_path, mock_s3_bucket
 ):
-
     mlflow.pmdarima.save_model(pmdarima_model=auto_arima_object_model, path=model_path)
 
     artifact_root = f"s3://{mock_s3_bucket}"
@@ -198,11 +200,11 @@ def test_pmdarima_log_model(auto_arima_model, tmp_path, should_start_run):
         assert model_info.model_uri == model_uri
         reloaded_model = mlflow.pmdarima.load_model(model_uri=model_uri)
         np.testing.assert_array_equal(auto_arima_model.predict(20), reloaded_model.predict(20))
-        model_path = pathlib.Path(_download_artifact_from_uri(artifact_uri=model_uri))
+        model_path = Path(_download_artifact_from_uri(artifact_uri=model_uri))
         model_config = Model.load(str(model_path.joinpath("MLmodel")))
         assert pyfunc.FLAVOR_NAME in model_config.flavors
         assert pyfunc.ENV in model_config.flavors[pyfunc.FLAVOR_NAME]
-        env_path = model_config.flavors[pyfunc.FLAVOR_NAME][pyfunc.ENV]
+        env_path = model_config.flavors[pyfunc.FLAVOR_NAME][pyfunc.ENV]["conda"]
         assert model_path.joinpath(env_path).exists()
     finally:
         mlflow.end_run()
@@ -245,7 +247,7 @@ def test_pmdarima_model_save_persists_specified_conda_env_in_mlflow_model_direct
         pmdarima_model=auto_arima_object_model, path=model_path, conda_env=str(pmdarima_custom_env)
     )
     pyfunc_conf = _get_flavor_configuration(model_path=model_path, flavor_name=pyfunc.FLAVOR_NAME)
-    saved_conda_env_path = model_path.joinpath(pyfunc_conf[pyfunc.ENV])
+    saved_conda_env_path = model_path.joinpath(pyfunc_conf[pyfunc.ENV]["conda"])
     assert saved_conda_env_path.exists()
     assert not pmdarima_custom_env.samefile(saved_conda_env_path)
 
@@ -265,11 +267,14 @@ def test_pmdarima_model_save_persists_requirements_in_mlflow_model_directory(
 
 
 def test_pmdarima_log_model_with_pip_requirements(auto_arima_object_model, tmp_path):
+    expected_mlflow_version = _mlflow_major_version_string()
     req_file = tmp_path.joinpath("requirements.txt")
     req_file.write_text("a")
     with mlflow.start_run():
         mlflow.pmdarima.log_model(auto_arima_object_model, "model", pip_requirements=str(req_file))
-        _assert_pip_requirements(mlflow.get_artifact_uri("model"), ["mlflow", "a"], strict=True)
+        _assert_pip_requirements(
+            mlflow.get_artifact_uri("model"), [expected_mlflow_version, "a"], strict=True
+        )
 
     # List of requirements
     with mlflow.start_run():
@@ -277,7 +282,7 @@ def test_pmdarima_log_model_with_pip_requirements(auto_arima_object_model, tmp_p
             auto_arima_object_model, "model", pip_requirements=[f"-r {req_file}", "b"]
         )
         _assert_pip_requirements(
-            mlflow.get_artifact_uri("model"), ["mlflow", "a", "b"], strict=True
+            mlflow.get_artifact_uri("model"), [expected_mlflow_version, "a", "b"], strict=True
         )
 
     # Constraints file
@@ -287,13 +292,14 @@ def test_pmdarima_log_model_with_pip_requirements(auto_arima_object_model, tmp_p
         )
         _assert_pip_requirements(
             mlflow.get_artifact_uri("model"),
-            ["mlflow", "b", "-c constraints.txt"],
+            [expected_mlflow_version, "b", "-c constraints.txt"],
             ["a"],
             strict=True,
         )
 
 
 def test_pmdarima_log_model_with_extra_pip_requirements(auto_arima_model, tmp_path):
+    expected_mlflow_version = _mlflow_major_version_string()
     default_reqs = mlflow.pmdarima.get_default_pip_requirements()
 
     # Path to a requirements file
@@ -301,7 +307,9 @@ def test_pmdarima_log_model_with_extra_pip_requirements(auto_arima_model, tmp_pa
     req_file.write_text("a")
     with mlflow.start_run():
         mlflow.pmdarima.log_model(auto_arima_model, "model", extra_pip_requirements=str(req_file))
-        _assert_pip_requirements(mlflow.get_artifact_uri("model"), ["mlflow", *default_reqs, "a"])
+        _assert_pip_requirements(
+            mlflow.get_artifact_uri("model"), [expected_mlflow_version, *default_reqs, "a"]
+        )
 
     # List of requirements
     with mlflow.start_run():
@@ -309,7 +317,7 @@ def test_pmdarima_log_model_with_extra_pip_requirements(auto_arima_model, tmp_pa
             auto_arima_model, "model", extra_pip_requirements=[f"-r {req_file}", "b"]
         )
         _assert_pip_requirements(
-            mlflow.get_artifact_uri("model"), ["mlflow", *default_reqs, "a", "b"]
+            mlflow.get_artifact_uri("model"), [expected_mlflow_version, *default_reqs, "a", "b"]
         )
 
     # Constraints file
@@ -319,7 +327,7 @@ def test_pmdarima_log_model_with_extra_pip_requirements(auto_arima_model, tmp_pa
         )
         _assert_pip_requirements(
             model_uri=mlflow.get_artifact_uri("model"),
-            requirements=["mlflow", *default_reqs, "b", "-c constraints.txt"],
+            requirements=[expected_mlflow_version, *default_reqs, "b", "-c constraints.txt"],
             constraints=["a"],
             strict=False,
         )
@@ -343,7 +351,6 @@ def test_pmdarima_model_log_without_conda_env_uses_default_env_with_expected_dep
 
 
 def test_pmdarima_pyfunc_serve_and_score(auto_arima_model):
-
     artifact_path = "model"
     with mlflow.start_run():
         mlflow.pmdarima.log_model(
@@ -358,36 +365,32 @@ def test_pmdarima_pyfunc_serve_and_score(auto_arima_model):
     resp = pyfunc_serve_and_score_model(
         model_uri,
         data=inference_data,
-        content_type=pyfunc_scoring_server.CONTENT_TYPE_JSON_RECORDS_ORIENTED,
+        content_type=pyfunc_scoring_server.CONTENT_TYPE_JSON,
         extra_args=EXTRA_PYFUNC_SERVING_TEST_ARGS,
     )
-    scores = pd.read_json(resp.content.decode("utf-8"), orient="records").to_numpy().flatten()
+    scores = (
+        pd.DataFrame(data=json.loads(resp.content.decode("utf-8"))["predictions"])
+        .to_numpy()
+        .flatten()
+    )
     np.testing.assert_array_almost_equal(scores, local_predict)
 
 
 def test_pmdarima_pyfunc_raises_invalid_df_input(auto_arima_model, model_path):
-
     mlflow.pmdarima.save_model(pmdarima_model=auto_arima_model, path=model_path)
     loaded_pyfunc = mlflow.pyfunc.load_model(model_uri=model_path)
 
     with pytest.raises(MlflowException, match="The provided prediction pd.DataFrame "):
-
-        predict_conf_rows = pd.DataFrame([{"n_periods": 60}, {"n_periods": 100}])
-        loaded_pyfunc.predict(predict_conf_rows)
+        loaded_pyfunc.predict(pd.DataFrame([{"n_periods": 60}, {"n_periods": 100}]))
 
     with pytest.raises(MlflowException, match="The provided prediction configuration "):
-
-        predict_conf_name = pd.DataFrame([{"invalid": True}])
-        loaded_pyfunc.predict(predict_conf_name)
+        loaded_pyfunc.predict(pd.DataFrame([{"invalid": True}]))
 
     with pytest.raises(MlflowException, match="The provided `n_periods` value "):
-
-        predict_conf_rows = pd.DataFrame([{"n_periods": "60"}])
-        loaded_pyfunc.predict(predict_conf_rows)
+        loaded_pyfunc.predict(pd.DataFrame([{"n_periods": "60"}]))
 
 
 def test_pmdarima_pyfunc_return_correct_structure(auto_arima_model, model_path):
-
     mlflow.pmdarima.save_model(pmdarima_model=auto_arima_model, path=model_path)
     loaded_pyfunc = mlflow.pyfunc.load_model(model_uri=model_path)
 
@@ -416,3 +419,64 @@ def test_log_model_with_code_paths(auto_arima_model):
         _compare_logged_code_paths(__file__, model_uri, mlflow.pmdarima.FLAVOR_NAME)
         mlflow.pmdarima.load_model(model_uri)
         add_mock.assert_called()
+
+
+def test_virtualenv_subfield_points_to_correct_path(auto_arima_model, model_path):
+    mlflow.pmdarima.save_model(auto_arima_model, path=model_path)
+    pyfunc_conf = _get_flavor_configuration(model_path=model_path, flavor_name=pyfunc.FLAVOR_NAME)
+    python_env_path = Path(model_path, pyfunc_conf[pyfunc.ENV]["virtualenv"])
+    assert python_env_path.exists()
+    assert python_env_path.is_file()
+
+
+def test_model_save_load_with_metadata(auto_arima_model, model_path):
+    mlflow.pmdarima.save_model(
+        auto_arima_model, path=model_path, metadata={"metadata_key": "metadata_value"}
+    )
+
+    reloaded_model = mlflow.pyfunc.load_model(model_uri=model_path)
+    assert reloaded_model.metadata.metadata["metadata_key"] == "metadata_value"
+
+
+def test_model_log_with_metadata(auto_arima_model):
+    artifact_path = "model"
+
+    with mlflow.start_run():
+        mlflow.pmdarima.log_model(
+            auto_arima_model,
+            artifact_path=artifact_path,
+            metadata={"metadata_key": "metadata_value"},
+        )
+        model_uri = mlflow.get_artifact_uri(artifact_path)
+
+    reloaded_model = mlflow.pyfunc.load_model(model_uri=model_uri)
+    assert reloaded_model.metadata.metadata["metadata_key"] == "metadata_value"
+
+
+def test_model_log_with_signature_inference(auto_arima_model):
+    artifact_path = "model"
+    example = pd.DataFrame({"n_periods": 60, "return_conf_int": True, "alpha": 0.1}, index=[0])
+
+    with mlflow.start_run():
+        mlflow.pmdarima.log_model(
+            auto_arima_model, artifact_path=artifact_path, input_example=example
+        )
+        model_uri = mlflow.get_artifact_uri(artifact_path)
+
+    model_info = Model.load(model_uri)
+    assert model_info.signature == ModelSignature(
+        inputs=Schema(
+            [
+                ColSpec(name="n_periods", type=DataType.long),
+                ColSpec(name="return_conf_int", type=DataType.boolean),
+                ColSpec(name="alpha", type=DataType.double),
+            ]
+        ),
+        outputs=Schema(
+            [
+                ColSpec(name="yhat", type=DataType.double),
+                ColSpec(name="yhat_lower", type=DataType.double),
+                ColSpec(name="yhat_upper", type=DataType.double),
+            ]
+        ),
+    )

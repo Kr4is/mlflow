@@ -12,6 +12,8 @@ MLflow Tracking lets you log and query experiments using :ref:`Python <python-ap
   :local:
   :depth: 2
 
+.. _tracking-concepts:
+
 Concepts
 ========
 
@@ -59,7 +61,7 @@ API.
 Where Runs Are Recorded
 =======================
 
-MLflow runs can be recorded to local files, to a SQLAlchemy compatible database, or remotely
+MLflow runs can be recorded to local files, to a SQLAlchemy-compatible database, or remotely
 to a tracking server. By default, the MLflow Python API logs runs locally to files in an ``mlruns`` directory wherever you
 ran your program. You can then run ``mlflow ui`` to see the logged runs.
 
@@ -73,12 +75,12 @@ There are different kinds of remote tracking URIs:
 - HTTP server (specified as ``https://my-server:5000``), which is a server hosting an :ref:`MLflow tracking server <tracking_server>`.
 - Databricks workspace (specified as ``databricks`` or as ``databricks://<profileName>``, a `Databricks CLI profile <https://github.com/databricks/databricks-cli#installation>`_.
   Refer to Access the MLflow tracking server from outside Databricks `[AWS] <http://docs.databricks.com/applications/mlflow/access-hosted-tracking-server.html>`_
-  `[Azure] <http://docs.microsoft.com/azure/databricks/applications/mlflow/access-hosted-tracking-server>`_, or :ref:`the quickstart <quickstart_logging_to_remote_server>` to
+  `[Azure] <http://docs.microsoft.com/azure/databricks/applications/mlflow/access-hosted-tracking-server>`_, or :ref:`the quickstart <quickstart_tracking_server>` to
   easily get started with hosted MLflow on Databricks Community Edition.
 
-How Runs and Artifacts are Recorded
+How runs and artifacts are recorded
 ===================================
-As mentioned above, MLflow runs can be recorded to local files, to a SQLAlchemy compatible database, or remotely to a tracking server. MLflow artifacts can be persisted to local files
+As mentioned above, MLflow runs can be recorded to local files, to a SQLAlchemy-compatible database, or remotely to a tracking server. MLflow artifacts can be persisted to local files
 and a variety of remote file storage solutions. For storing runs and artifacts, MLflow uses two components for `storage <https://mlflow.org/docs/latest/tracking.html#storage>`_: backend store and artifact store. While the backend store persists
 MLflow entities (runs, parameters, metrics, tags, notes, metadata, etc), the artifact store persists artifacts
 (files, models, images, in-memory objects, or model summary, etc).
@@ -98,6 +100,8 @@ on the local filesystem—``./mlruns``—as shown in the diagram. The MLflow cli
 instance of a `FileStore` and `LocalArtifactRepository`.
 
 .. figure:: _static/images/scenario_1.png
+    :align: center
+    :figwidth: 600
 
 In this simple scenario, the MLflow client uses the following interfaces to record MLflow entities and artifacts:
 
@@ -111,6 +115,8 @@ Many users also run MLflow on their local machines with a `SQLAlchemy-compatible
 are stored under the local ``./mlruns`` directory, and MLflow entities are inserted in a SQLite database file ``mlruns.db``.
 
 .. figure:: _static/images/scenario_2.png
+    :align: center
+    :figwidth: 600
 
 In this scenario, the MLflow client uses the following interfaces to record MLflow entities and artifacts:
 
@@ -129,6 +135,13 @@ As in scenario 1, MLflow uses a local `mlruns` filesystem directory as a backend
 server running, the MLflow client interacts with the tracking server via REST requests, as shown in the diagram.
 
 .. figure:: _static/images/scenario_3.png
+    :align: center
+    :figwidth: 800
+
+.. code-block:: bash
+    :caption: Command to run the tracking server in this configuration
+
+    mlflow server --backend-store-uri file:///path/to/mlruns --no-serve-artifacts
 
 To store all runs' MLflow entities, the MLflow client interacts with the tracking server via a series of REST requests:
 
@@ -153,6 +166,13 @@ reside on remote hosts. This example scenario depicts an architecture with a rem
 a Postgres database for backend entity storage, and an S3 bucket for artifact storage.
 
 .. figure:: _static/images/scenario_4.png
+    :align: center
+    :figwidth: 800
+
+.. code-block:: bash
+    :caption: Command to run the tracking server in this configuration
+
+    mlflow server --backend-store-uri postgresql://user:password@postgres:5432/mlflowdb --default-artifact-root s3://bucket_name --host remote_host --no-serve-artifacts
 
 To record all runs' MLflow entities, the MLflow client interacts with the tracking server via a series of REST requests:
 
@@ -191,6 +211,19 @@ This eliminates the need to allow end users to have direct path access to a remo
 need for an end-user to provide access credentials to interact with an underlying object store.
 
 .. figure:: _static/images/scenario_5.png
+    :align: center
+    :figwidth: 800
+
+.. code-block:: bash
+    :caption: Command to run the tracking server in this configuration
+
+    mlflow server \
+      --backend-store-uri postgresql://user:password@postgres:5432/mlflowdb \
+      # Artifact access is enabled through the proxy URI 'mlflow-artifacts:/',
+      # giving users access to this location without having to manage credentials
+      # or permissions.
+      --artifacts-destination s3://bucket_name \
+      --host remote_host
 
 Enabling the Tracking Server to perform proxied artifact access in order to route client artifact requests to an object store location:
 
@@ -239,6 +272,13 @@ MLflow's Tracking Server can be used in an exclusive artifact proxied artifact h
     Creating runs, logging metrics or parameters, and accessing other attributes about experiments are all not permitted in this mode.
 
 .. figure:: _static/images/scenario_6.png
+    :align: center
+    :figwidth: 800
+
+.. code-block:: bash
+    :caption: Command to run the tracking server in this configuration
+
+    mlflow server --artifacts-destination s3://bucket_name --artifacts-only --host remote_host
 
 Running an MLFlow server in ``--artifacts-only`` mode:
 
@@ -276,8 +316,9 @@ shows the Python API.
   :depth: 1
   :local:
 
+.. _tracking_logging_functions:
 
-Logging Functions
+Logging functions
 ------------------
 
 :py:func:`mlflow.set_tracking_uri` connects to a tracking URI. You can also set the
@@ -285,7 +326,7 @@ Logging Functions
 the URI can either be a HTTP/HTTPS URI for a remote server, a database connection string, or a
 local path to log data to a directory. The URI defaults to ``mlruns``.
 
-:py:func:`mlflow.tracking.get_tracking_uri` returns the current tracking URI.
+:py:func:`mlflow.get_tracking_uri` returns the current tracking URI.
 
 :py:func:`mlflow.create_experiment` creates a new experiment and returns its ID. Runs can be
 launched under the experiment by passing the experiment ID to ``mlflow.start_run``.
@@ -299,22 +340,28 @@ and returns a :py:class:`mlflow.ActiveRun` object usable as a context manager fo
 current run. You do not need to call ``start_run`` explicitly: calling one of the logging functions
 with no active run automatically starts a new one.
 
+.. note::
+  - If the argument ``run_name`` is not set within :py:func:`mlflow.start_run`, a unique run name will be generated for each run.
+
 :py:func:`mlflow.end_run` ends the currently active run, if any, taking an optional run status.
 
 :py:func:`mlflow.active_run` returns a :py:class:`mlflow.entities.Run` object corresponding to the
 currently active run, if any.
 **Note**: You cannot access currently-active run attributes
 (parameters, metrics, etc.) through the run returned by ``mlflow.active_run``. In order to access
-such attributes, use the :py:class:`mlflow.tracking.MlflowClient` as follows:
+such attributes, use the :py:class:`MlflowClient <mlflow.client.MlflowClient>` as follows:
 
-.. code-block:: py
+.. code-block:: python
 
-    client = mlflow.tracking.MlflowClient()
+    client = mlflow.MlflowClient()
     data = client.get_run(mlflow.active_run().info.run_id).data
 
-:py:func:`mlflow.last_active_run` retuns a :py:class:`mlflow.entities.Run` object corresponding to the
-currently active run, if any. Otherwise, it returns a :py:class:`mlflow.entities.Run` object corresponding 
+:py:func:`mlflow.last_active_run` returns a :py:class:`mlflow.entities.Run` object corresponding to the
+currently active run, if any. Otherwise, it returns a :py:class:`mlflow.entities.Run` object corresponding
 the last run started from the current Python process that reached a terminal status (i.e. FINISHED, FAILED, or KILLED).
+
+:py:func:`mlflow.get_parent_run` returns a :py:class:`mlflow.entities.Run` object corresponding to the
+parent run for the given run id, if one exists. Otherwise, it returns None.
 
 :py:func:`mlflow.log_param` logs a single key-value param in the currently active run. The key and
 value are both strings. Use :py:func:`mlflow.log_params` to log multiple params at once.
@@ -322,6 +369,9 @@ value are both strings. Use :py:func:`mlflow.log_params` to log multiple params 
 :py:func:`mlflow.log_metric` logs a single key-value metric. The value must always be a number.
 MLflow remembers the history of values for each metric. Use :py:func:`mlflow.log_metrics` to log
 multiple metrics at once.
+
+:py:func:`mlflow.log_input` logs a single :py:class:`mlflow.data.dataset.Dataset` object corresponding to the currently 
+active run. You may also log a dataset context string and a dict of key-value tags.
 
 :py:func:`mlflow.set_tag` sets a single key-value tag in the currently active run. The key and
 value are both strings. Use :py:func:`mlflow.set_tags` to set multiple tags at once.
@@ -346,7 +396,7 @@ easy to do because the ``ActiveRun`` object returned by :py:func:`mlflow.start_r
 `context manager <https://docs.python.org/2.5/whatsnew/pep-343.html>`_. You can "scope" each run to
 just one block of code as follows:
 
-.. code-block:: py
+.. code-block:: python
 
    with mlflow.start_run():
        mlflow.log_param("x", 1)
@@ -375,11 +425,11 @@ Examples
 ~~~~~~~~
 
 Python
-  .. code-block:: py
+  .. code-block:: python
 
     with mlflow.start_run():
         for epoch in range(0, 3):
-            mlflow.log_metric(key="quality", value=2*epoch, step=epoch)
+            mlflow.log_metric(key="quality", value=2 * epoch, step=epoch)
 
 Java and Scala
   .. code-block:: java
@@ -445,7 +495,7 @@ You can access the most recent autolog run through the :py:func:`mlflow.last_act
     X_train, X_test, y_train, y_test = train_test_split(db.data, db.target)
 
     # Create and train models.
-    rf = RandomForestRegressor(n_estimators = 100, max_depth = 6, max_features = 3)
+    rf = RandomForestRegressor(n_estimators=100, max_depth=6, max_features=3)
     rf.fit(X_train, y_train)
 
     # Use the model to make predictions on the test dataset.
@@ -500,46 +550,30 @@ containing the following data:
 .. _GridSearchCV:
     https://scikit-learn.org/stable/modules/generated/sklearn.model_selection.GridSearchCV.html
 
-TensorFlow and Keras
---------------------
-Call :py:func:`mlflow.tensorflow.autolog` or :py:func:`mlflow.keras.autolog` before your training code to enable automatic logging of metrics and parameters. See example usages with `Keras <https://github.com/mlflow/mlflow/tree/master/examples/keras>`_ and
-`TensorFlow <https://github.com/mlflow/mlflow/tree/master/examples/tensorflow>`_.
+Keras
+-----
+Call :py:func:`mlflow.tensorflow.autolog` before your training code to enable automatic logging of metrics and parameters. As an example, try running the `Keras/Tensorflow example <https://github.com/mlflow/mlflow/blob/master/examples/keras/train.py>`_.
 
-Note that autologging for ``tf.keras`` is handled by :py:func:`mlflow.tensorflow.autolog`, not :py:func:`mlflow.keras.autolog`.
-Whether you are using TensorFlow 1.x or 2.x, the respective metrics associated with ``tf.estimator`` and ``EarlyStopping`` are automatically logged.
-As an example, try running the `MLflow TensorFlow examples <https://github.com/mlflow/mlflow/tree/master/examples/tensorflow>`_.
+Note that only ``tensorflow>=2.3`` are supported.
+The respective metrics associated with ``tf.estimator`` and ``EarlyStopping`` are automatically logged.
+As an example, try running the `Keras/TensorFlow example <https://github.com/mlflow/mlflow/blob/master/examples/keras/train.py>`_.
 
 Autologging captures the following information:
 
 +------------------------------------------+------------------------------------------------------------+-------------------------------------------------------------------------------------+---------------+-----------------------------------------------------------------------------------------------------------------------------------------------+
 | Framework/module                         | Metrics                                                    | Parameters                                                                          | Tags          | Artifacts                                                                                                                                     |
 +------------------------------------------+------------------------------------------------------------+-------------------------------------------------------------------------------------+---------------+-----------------------------------------------------------------------------------------------------------------------------------------------+
-| ``keras``                                | Training loss; validation loss; user-specified metrics.    | ``fit()`` or ``fit_generator()`` parameters; optimizer name; learning rate; epsilon.| --            | Model summary on training start; `MLflow Model <https://mlflow.org/docs/latest/models.html>`_ (Keras model) on training end                   |
-|                                          |                                                            |                                                                                     |               |                                                                                                                                               |
-|                                          | Metrics from the ``EarlyStopping`` callbacks.              | Parameters associated with ``EarlyStopping``.                                       |               |                                                                                                                                               |
-|                                          | For example, ``stopped_epoch``, ``restored_epoch``,        | For example, ``min_delta``, ``patience``, ``baseline``,                             |               |                                                                                                                                               |
-|                                          | ``restore_best_weight``, etc.                              | ``restore_best_weights``, etc                                                       |               |                                                                                                                                               |
+| ``tf.keras``                             | Training loss; validation loss; user-specified metrics     | ``fit()`` parameters; optimizer name; learning rate; epsilon                        | --            | Model summary on training start; `MLflow Model <https://mlflow.org/docs/latest/models.html>`_ (Keras model); TensorBoard logs on training end |
 +------------------------------------------+------------------------------------------------------------+-------------------------------------------------------------------------------------+---------------+-----------------------------------------------------------------------------------------------------------------------------------------------+
-| ``tf.keras``                             | Training loss; validation loss; user-specified metrics     | ``fit()`` or ``fit_generator()`` parameters; optimizer name; learning rate; epsilon | --            | Model summary on training start; `MLflow Model <https://mlflow.org/docs/latest/models.html>`_ (Keras model); TensorBoard logs on training end |
-+------------------------------------------+------------------------------------------------------------+-------------------------------------------------------------------------------------+---------------+-----------------------------------------------------------------------------------------------------------------------------------------------+
-| ``tf.keras.callbacks.EarlyStopping``     | Metrics from the ``EarlyStopping`` callbacks. For example, | ``fit()`` or ``fit_generator()`` parameters from ``EarlyStopping``.                 | --            | --                                                                                                                                            |
+| ``tf.keras.callbacks.EarlyStopping``     | Metrics from the ``EarlyStopping`` callbacks. For example, | ``fit()`` parameters from ``EarlyStopping``.                                        | --            | --                                                                                                                                            |
 |                                          | ``stopped_epoch``, ``restored_epoch``,                     | For example, ``min_delta``, ``patience``, ``baseline``,                             |               |                                                                                                                                               |
 |                                          | ``restore_best_weight``, etc                               | ``restore_best_weights``, etc                                                       |               |                                                                                                                                               |
 +------------------------------------------+------------------------------------------------------------+-------------------------------------------------------------------------------------+---------------+-----------------------------------------------------------------------------------------------------------------------------------------------+
-| ``tf.estimator``                         | TensorBoard metrics. For example, ``average_loss``,        | ``steps``, ``max_steps``                                                            | --            | `MLflow Model <https://mlflow.org/docs/latest/models.html>`_ (TF saved model) on call to ``tf.estimator.export_saved_model``                  |
-|                                          | ``loss`` etc.                                              |                                                                                     |               |                                                                                                                                               |
-+------------------------------------------+------------------------------------------------------------+-------------------------------------------------------------------------------------+---------------+-----------------------------------------------------------------------------------------------------------------------------------------------+
-| TensorFlow Core                          | All ``tf.summary.scalar`` calls                            | --                                                                                  | --            | --                                                                                                                                            |
-+------------------------------------------+------------------------------------------------------------+-------------------------------------------------------------------------------------+---------------+-----------------------------------------------------------------------------------------------------------------------------------------------+
 
 If no active run exists when ``autolog()`` captures data, MLflow will automatically create a run to log information to.
-Also, MLflow will then automatically end the run once training ends via calls to ``tf.estimator.train()``, ``tf.keras.fit()``, ``tf.keras.fit_generator()``, ``keras.fit()`` or ``keras.fit_generator()``,
-or once ``tf.estimator`` models are exported via ``tf.estimator.export_saved_model()``.
+Also, MLflow will then automatically end the run once training ends via calls to ``tf.keras.fit()``.
 
 If a run already exists when ``autolog()`` captures data, MLflow will log to that run but not automatically end that run after training.
-
-.. note::
-  - Parameters not explicitly passed by users (parameters that use default values) while using ``keras.Model.fit_generator()`` are not currently automatically logged.
 
 Gluon
 -----
@@ -568,9 +602,6 @@ Autologging captures the following information:
 
 If early stopping is activated, metrics at the best iteration will be logged as an extra step/iteration.
 
-.. note::
-  - The `scikit-learn API <https://xgboost.readthedocs.io/en/latest/python/python_api.html#module-xgboost.sklearn>`__ is not supported.
-
 .. _xgboost.train: https://xgboost.readthedocs.io/en/latest/python/python_api.html#xgboost.train
 .. _MLflow Model: https://mlflow.org/docs/latest/models.html
 
@@ -588,9 +619,6 @@ Autologging captures the following information:
 +-----------+------------------------+------------------------------+---------------+-----------------------------------------------------------------------------------------------------------+
 
 If early stopping is activated, metrics at the best iteration will be logged as an extra step/iteration.
-
-.. note::
-  - The `scikit-learn API <https://lightgbm.readthedocs.io/en/latest/Python-API.html#scikit-learn-api>`__ is not supported.
 
 .. _lightgbm.train: https://lightgbm.readthedocs.io/en/latest/pythonapi/lightgbm.train.html#lightgbm-train
 
@@ -707,7 +735,7 @@ environment variable. Alternatively, you can use the experiment ID instead, via 
 
     mlflow experiments create --experiment-name fraud-detection
 
-.. code-block:: py
+.. code-block:: python
 
     # Launch a run. The experiment is inferred from the MLFLOW_EXPERIMENT_NAME environment
     # variable, or from the --experiment-name parameter passed to the MLflow CLI (the latter
@@ -720,31 +748,34 @@ Managing Experiments and Runs with the Tracking Service API
 -----------------------------------------------------------
 
 MLflow provides a more detailed Tracking Service API for managing experiments and runs directly,
-which is available through client SDK in the :py:mod:`mlflow.tracking` module.
+which is available through client SDK in the :py:mod:`mlflow.client` module.
 This makes it possible to query data about past runs, log additional information about them, create experiments,
 add tags to a run, and more.
 
 .. rubric:: Example
 
-.. code-block:: py
+.. code-block:: python
 
-    from  mlflow.tracking import MlflowClient
+    from mlflow.tracking import MlflowClient
+
     client = MlflowClient()
-    experiments = client.list_experiments() # returns a list of mlflow.entities.Experiment
-    run = client.create_run(experiments[0].experiment_id) # returns mlflow.entities.Run
+    experiments = (
+        client.search_experiments()
+    )  # returns a list of mlflow.entities.Experiment
+    run = client.create_run(experiments[0].experiment_id)  # returns mlflow.entities.Run
     client.log_param(run.info.run_id, "hello", "world")
     client.set_terminated(run.info.run_id)
 
 Adding Tags to Runs
 ~~~~~~~~~~~~~~~~~~~
 
-The :py:func:`mlflow.tracking.MlflowClient.set_tag` function lets you add custom tags to runs. A tag can only have a single unique value mapped to it at a time. For example:
+The :py:func:`MlflowClient.set_tag() <mlflow.client.MlflowClient.set_tag>` function lets you add custom tags to runs. A tag can only have a single unique value mapped to it at a time. For example:
 
-.. code-block:: py
+.. code-block:: python
 
   client.set_tag(run.info.run_id, "tag_key", "tag_value")
 
-.. important:: Do not use the prefix ``mlflow`` for a tag.  This prefix is reserved for use by MLflow.
+.. important:: Do not use the prefix ``mlflow.`` (e.g. ``mlflow.note``) for a tag.  This prefix is reserved for use by MLflow. See :ref:`system_tags` for a list of reserved tag keys.
 
 .. _tracking_ui:
 
@@ -760,7 +791,7 @@ machine, including any remote machine that can connect to your tracking server.
 
 The UI contains the following key features:
 
-* Experiment-based run listing and comparison
+* Experiment-based run listing and comparison (including run comparison across multiple experiments)
 * Searching for runs by parameter or metric value
 * Visualizing run metrics
 * Downloading run results
@@ -774,7 +805,7 @@ You can access all of the functions in the Tracking UI programmatically. This ma
 
 * Query and compare runs using any data analysis tool of your choice, for example, **pandas**.
 * Determine the artifact URI for a run to feed some of its artifacts into a new run when executing a workflow. For an example of querying runs and constructing a multistep workflow, see the MLflow `Multistep Workflow Example project <https://github.com/mlflow/mlflow/blob/15cc05ce2217b7c7af4133977b07542934a9a19f/examples/multistep_workflow/main.py#L63>`_.
-* Load artifacts from past runs as :ref:`models`. For an example of training, exporting, and loading a model, and predicting using the model, see the MLflow `TensorFlow example <https://github.com/mlflow/mlflow/tree/master/examples/tensorflow>`_.
+* Load artifacts from past runs as :ref:`models`. For an example of training, exporting, and loading a model, and predicting using the model, see the MLflow `Keras/TensorFlow example <https://github.com/mlflow/mlflow/blob/master/examples/keras/train.py>`_.
 * Run automated parameter search algorithms, where you query the metrics from various runs to submit new ones. For an example of running automated parameter search algorithms, see the MLflow `Hyperparameter Tuning Example project <https://github.com/mlflow/mlflow/blob/master/examples/hyperparam/README.rst>`_.
 
 
@@ -790,21 +821,12 @@ MLflow Tracking Servers
 You run an MLflow tracking server using ``mlflow server``.  An example configuration for a server is:
 
 .. code-block:: bash
+    :caption: Command to run the tracking server in this configuration
 
     mlflow server \
         --backend-store-uri /mnt/persistent-disk \
         --default-artifact-root s3://my-mlflow-bucket/ \
         --host 0.0.0.0
-
-An MLflow Tracking server can also be run as a proxied artifact handler. An example configuration for the ``mlflow server`` in this mode is:
-
-.. code-block:: bash
-
-    mlflow server \
-        --host 0.0.0.0 \
-        --port 8889 \
-        --serve-artifacts \
-        --artifacts-destination s3://my-mlflow-bucket/ \
 
 .. note::
     When started in ``--artifacts-only`` mode, the tracking server will not permit any operation other than saving, loading, and listing artifacts.
@@ -860,7 +882,7 @@ Artifact Stores
 The artifact store is a location suitable for large data (such as an S3 bucket or shared NFS
 file system) and is where clients log their artifact output (for example, models).
 ``artifact_location`` is a property recorded on :py:class:`mlflow.entities.Experiment` for
-default location to store artifacts for all runs in this experiment. Additional, ``artifact_uri``
+default location to store artifacts for all runs in this experiment. Additionally, ``artifact_uri``
 is a property on :py:class:`mlflow.entities.RunInfo` to indicate location where all artifacts for
 this run are stored.
 
@@ -875,13 +897,14 @@ location to server's artifact store. This will be used as artifact location for 
 experiments that do not specify one. Once you create an experiment, ``--default-artifact-root``
 is no longer relevant to that experiment.
 
-Starting a server with the ``--serve-artifacts`` flag enables proxied access for artifacts.
+By default, a server is launched with the ``--serve-artifacts`` flag to enable proxied access for artifacts.
 The uri ``mlflow-artifacts:/`` replaces an otherwise explicit object store destination (e.g., "s3:/my_bucket/mlartifacts")
 for interfacing with artifacts. The client can access artifacts via HTTP requests to the MLflow Tracking Server.
 This simplifies access requirements for users of the MLflow client, eliminating the need to
 configure access tokens or username and password environment variables for the underlying object store when writing or retrieving artifacts.
+To disable proxied access for artifacts, specify ``--no-serve-artifacts``.
 
-Provided an Mlflow server configuraton where the ``--default-artifact-root`` is ``s3://my-root-bucket``,
+Provided an Mlflow server configuration where the ``--default-artifact-root`` is ``s3://my-root-bucket``,
 the following patterns will all resolve to the configured proxied object store location of ``s3://my-root-bucket/mlartifacts``:
 
  * ``https://<host>:<port>/mlartifacts``
@@ -916,12 +939,15 @@ See `Set up AWS Credentials and Region for Development <https://docs.aws.amazon.
   is a path inside the file store. Typically this is not an appropriate location, as the client and
   server probably refer to different physical locations (that is, the same path on different disks).
 
+You may set an MLflow environment variable to configure the timeout for artifact uploads and downloads:
+
+- ``MLFLOW_ARTIFACT_UPLOAD_DOWNLOAD_TIMEOUT`` - (Experimental, may be changed or removed) Sets the timeout for artifact upload/download in seconds (Default set by individual artifact stores).
 
 Amazon S3 and S3-compatible storage
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 To store artifacts in S3 (whether on Amazon S3 or on an S3-compatible alternative, such as
-`MinIO <https://min.io/>`_), specify a URI of the form ``s3://<bucket>/<path>``. MLflow obtains
+`MinIO <https://min.io/>`_ or `Digital Ocean Spaces <https://www.digitalocean.com/products/spaces>`_), specify a URI of the form ``s3://<bucket>/<path>``. MLflow obtains
 credentials to access S3 from your machine's IAM role, a profile in ``~/.aws/credentials``, or
 the environment variables ``AWS_ACCESS_KEY_ID`` and ``AWS_SECRET_ACCESS_KEY`` depending on which of
 these are available. For more information on how to set credentials, see
@@ -936,8 +962,13 @@ For example, if you want to upload to a KMS Encrypted bucket using the KMS Key 1
 
 For a list of available extra args see `Boto3 ExtraArgs Documentation <https://github.com/boto/boto3/blob/develop/docs/source/guide/s3-uploading-files.rst#the-extraargs-parameter>`_.
 
-To store artifacts in a custom endpoint, set the ``MLFLOW_S3_ENDPOINT_URL`` to your endpoint's URL.
-For example, if you have a MinIO server at 1.2.3.4 on port 9000:
+To store artifacts in a custom endpoint, set the ``MLFLOW_S3_ENDPOINT_URL`` to your endpoint's URL. For example, if you are using Digital Ocean Spaces:
+
+.. code-block:: bash
+
+  export MLFLOW_S3_ENDPOINT_URL=https://<region>.digitaloceanspaces.com
+
+If you have a MinIO server at 1.2.3.4 on port 9000:
 
 .. code-block:: bash
 
@@ -987,6 +1018,10 @@ Also, you must run ``pip install azure-storage-blob`` separately (on both your c
 Finally, if you want to use DefaultAzureCredential, you must ``pip install azure-identity``;
 MLflow does not declare a dependency on these packages by default.
 
+You may set an MLflow environment variable to configure the timeout for artifact uploads and downloads:
+
+- ``MLFLOW_ARTIFACT_UPLOAD_DOWNLOAD_TIMEOUT`` - (Experimental, may be changed or removed) Sets the timeout for artifact upload/download in seconds (Default: 600 for Azure blob).
+
 Google Cloud Storage
 ^^^^^^^^^^^^^^^^^^^^
 
@@ -1000,7 +1035,8 @@ to access Google Cloud Storage; MLflow does not declare a dependency on this pac
 
 You may set some MLflow environment variables to troubleshoot GCS read-timeouts (eg. due to slow transfer speeds) using the following variables:
 
-- ``MLFLOW_GCS_DEFAULT_TIMEOUT`` - Sets the standard timeout for transfer operations in seconds (Default: 60). Use -1 for indefinite timeout.
+- ``MLFLOW_ARTIFACT_UPLOAD_DOWNLOAD_TIMEOUT`` - (Experimental, may be changed or removed) Sets the standard timeout for transfer operations in seconds (Default: 60 for GCS). Use -1 for indefinite timeout.
+- ``MLFLOW_GCS_DEFAULT_TIMEOUT`` - (Deprecated, please use ``MLFLOW_ARTIFACT_UPLOAD_DOWNLOAD_TIMEOUT``) Sets the standard timeout for transfer operations in seconds (Default: 60). Use -1 for indefinite timeout.
 - ``MLFLOW_GCS_UPLOAD_CHUNK_SIZE`` - Sets the standard upload chunk size for bigger files in bytes (Default: 104857600 ≙ 100MiB), must be multiple of 256 KB.
 - ``MLFLOW_GCS_DOWNLOAD_CHUNK_SIZE`` - Sets the standard download chunk size for bigger files in bytes (Default: 104857600 ≙ 100MiB), must be multiple of 256 KB
 
@@ -1088,6 +1124,8 @@ You can inject some `SQLAlchemy connection pooling options <https://docs.sqlalch
 +-----------------------------------------+-----------------------------+
 | ``MLFLOW_SQLALCHEMYSTORE_POOL_SIZE``    | ``pool_size``               |
 +-----------------------------------------+-----------------------------+
+| ``MLFLOW_SQLALCHEMYSTORE_POOL_RECYCLE`` | ``pool_recycle``            |
++-----------------------------------------+-----------------------------+
 | ``MLFLOW_SQLALCHEMYSTORE_MAX_OVERFLOW`` | ``max_overflow``            |
 +-----------------------------------------+-----------------------------+
 
@@ -1127,13 +1165,12 @@ To start the MLflow server with proxy artifact access enabled to an HDFS locatio
         --host 0.0.0.0 \
         --port 8885 \
         --artifacts-destination hdfs://myhost:8887/mlprojects/models \
-        --serve-artifacts
 
 Optionally using a Tracking Server instance exclusively for artifact handling
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 If the volume of tracking server requests is sufficiently large and performance issues are noticed, a tracking server
 can be configured to serve in ``--artifacts-only`` mode ( :ref:`scenario_6` ), operating in tandem with an instance that
-operates without ``--serve-artifacts`` enabled. This configuration ensures that the processing of artifacts is isolated
+operates with ``--no-serve-artifacts`` specified. This configuration ensures that the processing of artifacts is isolated
 from all other tracking server event handling.
 
 When a tracking server is configured in ``--artifacts-only`` mode, any tasks apart from those concerned with artifact
@@ -1144,6 +1181,7 @@ See the following example of a client REST call in Python attempting to list exp
 .. code-block:: python
 
     import requests
+
     response = requests.get("http://0.0.0.0:8885/api/2.0/mlflow/experiments/list")
 
 Output
@@ -1174,7 +1212,8 @@ then make API requests to your remote tracking server.
     .. code-block:: python
 
         import mlflow
-        remote_server_uri = "..." # set to your server URI
+
+        remote_server_uri = "..."  # set to your server URI
         mlflow.set_tracking_uri(remote_server_uri)
         # Note: on Databricks, the experiment name passed to mlflow_set_experiment must be a
         # valid path in the workspace
@@ -1224,6 +1263,21 @@ allow passing HTTP authentication to the tracking server:
     For this reason, the client needs direct access to the artifact store. For instructions on setting up these credentials,
     see :ref:`Artifact Stores <artifact-stores>`.
 
+Tracking Server versioning
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The version of MLflow running on the server can be found by querying the ``/version`` endpoint.
+This can be used to check that the client-side version of MLflow is up-to-date with a remote tracking server prior to running experiments.
+For example:
+
+.. code-block:: python
+
+    import requests
+    import mlflow
+
+    response = requests.get("http://<mlflow-host>:<mlflow-port>/version")
+    assert response.text == mlflow.__version__  # Checking for a strict version match
+
 
 .. _system_tags:
 
@@ -1236,8 +1290,6 @@ internal use. The following tags are set automatically by MLflow, when appropria
 +-------------------------------+----------------------------------------------------------------------------------------+
 | Key                           | Description                                                                            |
 +===============================+========================================================================================+
-| ``mlflow.runName``            | Human readable name that identifies this run.                                          |
-+-------------------------------+----------------------------------------------------------------------------------------+
 | ``mlflow.note.content``       | A descriptive note about this run. This reserved tag is not set automatically and can  |
 |                               | be overridden by the user to include additional information about the run. The content |
 |                               | is displayed on the run's page under the Notes section.                                |
@@ -1266,7 +1318,7 @@ internal use. The following tags are set automatically by MLflow, when appropria
 +-------------------------------+----------------------------------------------------------------------------------------+
 | ``mlflow.docker.image.id``    | ID of the Docker image used to execute this run.                                       |
 +-------------------------------+----------------------------------------------------------------------------------------+
-| ``mlflow.log-model.history``  | (Experimental) Model metadata collected by log-model calls. Includes the serialized    |
+| ``mlflow.log-model.history``  | Model metadata collected by log-model calls. Includes the serialized                   |
 |                               | form of the MLModel model files logged to a run, although the exact format and         |
 |                               | information captured is subject to change.                                             |
 +-------------------------------+----------------------------------------------------------------------------------------+

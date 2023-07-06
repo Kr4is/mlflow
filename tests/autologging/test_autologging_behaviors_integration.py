@@ -11,7 +11,7 @@ from itertools import permutations
 from unittest import mock
 
 import mlflow
-from mlflow.tracking import MlflowClient
+from mlflow import MlflowClient
 from mlflow.utils import gorilla
 from mlflow.utils.autologging_utils import (
     safe_patch,
@@ -23,12 +23,8 @@ from tests.autologging.fixtures import test_mode_off
 from tests.autologging.fixtures import reset_stderr  # pylint: disable=unused-import
 
 
-pytestmark = pytest.mark.large
-
-
 AUTOLOGGING_INTEGRATIONS_TO_TEST = {
     mlflow.sklearn: "sklearn",
-    mlflow.keras: "keras",
     mlflow.xgboost: "xgboost",
     mlflow.lightgbm: "lightgbm",
     mlflow.pytorch: "torch",
@@ -242,10 +238,10 @@ def test_autolog_respects_disable_flag_across_import_orders():
 
 
 @pytest.mark.usefixtures(test_mode_off.__name__)
-def test_autolog_respects_silent_mode(tmpdir):
+def test_autolog_respects_silent_mode(tmp_path):
     # Use file-based experiment storage for this test. Otherwise, concurrent experiment creation in
     # multithreaded contexts may fail for other storage backends (e.g. SQLAlchemy)
-    mlflow.set_tracking_uri(str(tmpdir))
+    mlflow.set_tracking_uri(str(tmp_path))
     mlflow.set_experiment("test_experiment")
 
     og_showwarning = warnings.showwarning
@@ -317,9 +313,9 @@ def test_autolog_globally_configured_flag_set_correctly():
     from mlflow.utils.autologging_utils import AUTOLOGGING_INTEGRATIONS
 
     AUTOLOGGING_INTEGRATIONS.clear()
-    import sklearn  # pylint: disable=unused-import,unused-variable
-    import pyspark  # pylint: disable=unused-import,unused-variable
-    import pyspark.ml  # pylint: disable=unused-import,unused-variable
+    import sklearn  # pylint: disable=unused-import
+    import pyspark  # pylint: disable=unused-import
+    import pyspark.ml  # pylint: disable=unused-import
 
     integrations_to_test = ["sklearn", "spark", "pyspark.ml"]
     mlflow.autolog()

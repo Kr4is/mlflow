@@ -72,7 +72,7 @@ def test_all_models_are_listed_after_creating_many_models(sagemaker_client):
     model_names = []
 
     for i in range(100):
-        model_name = "sample-model-{idx}".format(idx=i)
+        model_name = f"sample-model-{i}"
         model_names.append(model_name)
 
         create_sagemaker_model(sagemaker_client=sagemaker_client, model_name=model_name)
@@ -191,7 +191,7 @@ def test_all_endpoint_configs_are_listed_after_creating_many_configs(sagemaker_c
     endpoint_config_names = []
 
     for i in range(100):
-        endpoint_config_name = "sample-config-{idx}".format(idx=i)
+        endpoint_config_name = f"sample-config-{i}"
         endpoint_config_names.append(endpoint_config_name)
 
         create_endpoint_config(
@@ -223,9 +223,14 @@ def test_describe_endpoint_config_response_contains_expected_attributes(sagemake
             "InitialVariantWeight": 1.0,
         },
     ]
+    async_inference_config = {
+        "ClientConfig": {"MaxConcurrentInvocationsPerInstance": 4},
+        "OutputConfig": {"S3OutputPath": "s3://bucket_name/", "NotificationConfig": {}},
+    }
     sagemaker_client.create_endpoint_config(
         EndpointConfigName=endpoint_config_name,
         ProductionVariants=production_variants,
+        AsyncInferenceConfig=async_inference_config,
     )
 
     describe_endpoint_config_response = sagemaker_client.describe_endpoint_config(
@@ -237,6 +242,8 @@ def test_describe_endpoint_config_response_contains_expected_attributes(sagemake
     assert describe_endpoint_config_response["EndpointConfigName"] == endpoint_config_name
     assert "ProductionVariants" in describe_endpoint_config_response
     assert describe_endpoint_config_response["ProductionVariants"] == production_variants
+    assert "AsyncInferenceConfig" in describe_endpoint_config_response
+    assert describe_endpoint_config_response["AsyncInferenceConfig"] == async_inference_config
 
 
 @mock_sagemaker
@@ -360,7 +367,7 @@ def test_all_endpoint_are_listed_after_creating_many_endpoints(sagemaker_client)
     endpoint_names = []
 
     for i in range(100):
-        endpoint_name = "sample-endpoint-{idx}".format(idx=i)
+        endpoint_name = f"sample-endpoint-{i}"
         endpoint_names.append(endpoint_name)
 
         sagemaker_client.create_endpoint(
@@ -614,7 +621,7 @@ def test_all_transform_jobs_are_listed_after_creating_many_transform_jobs(sagema
     job_names = []
 
     for i in range(100):
-        job_name = "sample-job-{idx}".format(idx=i)
+        job_name = f"sample-job-{i}"
         job_names.append(job_name)
 
         sagemaker_client.create_transform_job(

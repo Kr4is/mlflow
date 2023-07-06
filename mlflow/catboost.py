@@ -13,18 +13,21 @@ CatBoost (native) format
     https://catboost.ai/docs/concepts/python-reference_catboost_save_model.html
 .. _CatBoostClassifier:
     https://catboost.ai/docs/concepts/python-reference_catboostclassifier.html
+.. _CatBoostRanker:
+    https://catboost.ai/docs/concepts/python-reference_catboostranker.html
 .. _CatBoostRegressor:
     https://catboost.ai/docs/concepts/python-reference_catboostregressor.html
 """
 
 import os
 import yaml
+import contextlib
 
 import mlflow
 from mlflow import pyfunc
-from mlflow.models import Model, ModelInputExample
+from mlflow.models import Model, ModelInputExample, ModelSignature
 from mlflow.models.model import MLMODEL_FILE_NAME
-from mlflow.models.signature import ModelSignature
+from mlflow.models.signature import _infer_signature_from_input_example
 from mlflow.models.utils import _save_example
 from mlflow.tracking.artifact_utils import _download_artifact_from_uri
 from mlflow.utils.environment import (
@@ -35,6 +38,8 @@ from mlflow.utils.environment import (
     _CONDA_ENV_FILE_NAME,
     _REQUIREMENTS_FILE_NAME,
     _CONSTRAINTS_FILE_NAME,
+    _PYTHON_ENV_FILE_NAME,
+    _PythonEnv,
 )
 from mlflow.utils.requirements_utils import _get_pinned_requirement
 from mlflow.utils.file_utils import write_to
@@ -82,40 +87,28 @@ def save_model(
     input_example: ModelInputExample = None,
     pip_requirements=None,
     extra_pip_requirements=None,
+    metadata=None,
     **kwargs,
 ):
     """
     Save a CatBoost model to a path on the local file system.
 
     :param cb_model: CatBoost model (an instance of `CatBoost`_, `CatBoostClassifier`_,
-                     or `CatBoostRegressor`_) to be saved.
+                    `CatBoostRanker`_, or `CatBoostRegressor`_) to be saved.
     :param path: Local path where the model is to be saved.
     :param conda_env: {{ conda_env }}
     :param code_paths: A list of local filesystem paths to Python file dependencies (or directories
                        containing file dependencies). These files are *prepended* to the system
                        path when the model is loaded.
     :param mlflow_model: :py:mod:`mlflow.models.Model` this flavor is being added to.
-    :param signature: :py:class:`ModelSignature <mlflow.models.ModelSignature>`
-                      describes model input and output :py:class:`Schema <mlflow.types.Schema>`.
-                      The model signature can be :py:func:`inferred <mlflow.models.infer_signature>`
-                      from datasets with valid model input (e.g. the training dataset with target
-                      column omitted) and valid model output (e.g. model predictions generated on
-                      the training dataset), for example:
-
-                      .. code-block:: python
-
-                        from mlflow.models.signature import infer_signature
-                        train = df.drop_column("target_label")
-                        predictions = ... # compute model predictions
-                        signature = infer_signature(train, predictions)
-
-    :param input_example: Input example provides one or several instances of valid
-                          model input. The example can be used as a hint of what data to feed the
-                          model. The given example will be converted to a Pandas DataFrame and then
-                          serialized to json using the Pandas split-oriented format. Bytes are
-                          base64-encoded.
+    :param signature: {{ signature }}
+    :param input_example: {{ input_example }}
     :param pip_requirements: {{ pip_requirements }}
     :param extra_pip_requirements: {{ extra_pip_requirements }}
+    :param metadata: Custom metadata dictionary passed to the model and stored in the MLmodel file.
+
+                     .. Note:: Experimental: This parameter may change or be removed in a future
+                                             release without warning.
     :param kwargs: kwargs to pass to `CatBoost.save_model`_ method.
     """
     import catboost as cb
@@ -126,12 +119,20 @@ def save_model(
     _validate_and_prepare_target_save_path(path)
     code_dir_subpath = _validate_and_copy_code_paths(code_paths, path)
 
+    if signature is None and input_example is not None:
+        wrapped_model = _CatboostModelWrapper(cb_model)
+        signature = _infer_signature_from_input_example(input_example, wrapped_model)
+    elif signature is False:
+        signature = None
+
     if mlflow_model is None:
         mlflow_model = Model()
     if signature is not None:
         mlflow_model.signature = signature
     if input_example is not None:
         _save_example(mlflow_model, input_example, path)
+    if metadata is not None:
+        mlflow_model.metadata = metadata
 
     model_data_path = os.path.join(path, _MODEL_BINARY_FILE_NAME)
     cb_model.save_model(model_data_path, **kwargs)
@@ -140,7 +141,8 @@ def save_model(
     pyfunc.add_to_model(
         mlflow_model,
         loader_module="mlflow.catboost",
-        env=_CONDA_ENV_FILE_NAME,
+        conda_env=_CONDA_ENV_FILE_NAME,
+        python_env=_PYTHON_ENV_FILE_NAME,
         code=code_dir_subpath,
         **model_bin_kwargs,
     )
@@ -186,6 +188,8 @@ def save_model(
     # Save `requirements.txt`
     write_to(os.path.join(path, _REQUIREMENTS_FILE_NAME), "\n".join(pip_requirements))
 
+    _PythonEnv.current().to_yaml(os.path.join(path, _PYTHON_ENV_FILE_NAME))
+
 
 @format_docstring(LOG_MODEL_PARAM_DOCS.format(package_name=FLAVOR_NAME))
 def log_model(
@@ -199,13 +203,14 @@ def log_model(
     await_registration_for=DEFAULT_AWAIT_MAX_SLEEP_SECONDS,
     pip_requirements=None,
     extra_pip_requirements=None,
+    metadata=None,
     **kwargs,
 ):
     """
     Log a CatBoost model as an MLflow artifact for the current run.
 
     :param cb_model: CatBoost model (an instance of `CatBoost`_, `CatBoostClassifier`_,
-                     or `CatBoostRegressor`_) to be saved.
+                    `CatBoostRanker`_, or `CatBoostRegressor`_) to be saved.
     :param artifact_path: Run-relative artifact path.
     :param conda_env: {{ conda_env }}
     :param code_paths: A list of local filesystem paths to Python file dependencies (or directories
@@ -215,31 +220,17 @@ def log_model(
                                   future release without warning. If given, create a model
                                   version under ``registered_model_name``, also creating a
                                   registered model if one with the given name does not exist.
-    :param signature: :py:class:`ModelSignature <mlflow.models.ModelSignature>`
-                      describes model input and output :py:class:`Schema <mlflow.types.Schema>`.
-                      The model signature can be :py:func:`inferred <mlflow.models.infer_signature>`
-                      from datasets with valid model input (e.g. the training dataset with target
-                      column omitted) and valid model output (e.g. model predictions generated on
-                      the training dataset), for example:
-
-                      .. code-block:: python
-
-                        from mlflow.models.signature import infer_signature
-                        train = df.drop_column("target_label")
-                        predictions = ... # compute model predictions
-                        signature = infer_signature(train, predictions)
-
-    :param input_example: Input example provides one or several instances of valid
-                          model input. The example can be used as a hint of what data to feed the
-                          model. The given example will be converted to a Pandas DataFrame and then
-                          serialized to json using the Pandas split-oriented format. Bytes are
-                          base64-encoded.
-
+    :param signature: {{ signature }}
+    :param input_example: {{ input_example }}
     :param await_registration_for: Number of seconds to wait for the model version to finish
                         being created and is in ``READY`` status. By default, the function
                         waits for five minutes. Specify 0 or None to skip waiting.
     :param pip_requirements: {{ pip_requirements }}
     :param extra_pip_requirements: {{ extra_pip_requirements }}
+    :param metadata: Custom metadata dictionary passed to the model and stored in the MLmodel file.
+
+                     .. Note:: Experimental: This parameter may change or be removed in a future
+                                             release without warning.
     :param kwargs: kwargs to pass to `CatBoost.save_model`_ method.
     :return: A :py:class:`ModelInfo <mlflow.models.model.ModelInfo>` instance that contains the
              metadata of the logged model.
@@ -256,6 +247,7 @@ def log_model(
         await_registration_for=await_registration_for,
         pip_requirements=pip_requirements,
         extra_pip_requirements=extra_pip_requirements,
+        metadata=metadata,
         **kwargs,
     )
 
@@ -264,6 +256,11 @@ def _init_model(model_type):
     from catboost import CatBoost, CatBoostClassifier, CatBoostRegressor
 
     model_types = {c.__name__: c for c in [CatBoost, CatBoostClassifier, CatBoostRegressor]}
+
+    with contextlib.suppress(ImportError):
+        from catboost import CatBoostRanker
+
+        model_types[CatBoostRanker.__name__] = CatBoostRanker
 
     if model_type not in model_types:
         raise TypeError(
@@ -313,7 +310,7 @@ def load_model(model_uri, dst_path=None):
                      This directory must already exist. If unspecified, a local output
                      path will be created.
 
-    :return: A CatBoost model (an instance of `CatBoost`_, `CatBoostClassifier`_,
+    :return: A CatBoost model (an instance of `CatBoost`_, `CatBoostClassifier`_, `CatBoostRanker`_,
              or `CatBoostRegressor`_)
     """
     local_model_path = _download_artifact_from_uri(artifact_uri=model_uri, output_path=dst_path)

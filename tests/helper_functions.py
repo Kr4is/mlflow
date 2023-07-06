@@ -1,9 +1,9 @@
 import os
 import random
 import functools
+import shutil
 from unittest import mock
 from contextlib import ExitStack, contextmanager
-
 
 import logging
 import requests
@@ -14,6 +14,8 @@ import subprocess
 import uuid
 import sys
 import yaml
+import json
+import numbers
 
 import pytest
 
@@ -22,12 +24,16 @@ from mlflow.tracking.artifact_utils import _download_artifact_from_uri
 from mlflow.utils.file_utils import read_yaml, write_yaml
 from mlflow.utils.environment import (
     _get_pip_deps,
+    _generate_mlflow_version_pinning,
     _CONDA_ENV_FILE_NAME,
     _REQUIREMENTS_FILE_NAME,
     _CONSTRAINTS_FILE_NAME,
 )
 
+
+AWS_METADATA_IP = "169.254.169.254"  # Used to fetch AWS Instance and User metadata.
 LOCALHOST = "127.0.0.1"
+PROTOBUF_REQUIREMENT = "protobuf<4.0.0"
 
 _logger = logging.getLogger(__name__)
 
@@ -47,8 +53,8 @@ def random_int(lo=1, hi=1e10):
 
 def random_str(size=10):
     msg = (
-        "UUID4 generated strings have a high potential for collision at small sizes."
-        "10 is set as the lower bounds for random string generation to prevent non-deterministic"
+        "UUID4 generated strings have a high potential for collision at small sizes. "
+        "10 is set as the lower bounds for random string generation to prevent non-deterministic "
         "test failures."
     )
     assert size >= 10, msg
@@ -57,6 +63,13 @@ def random_str(size=10):
 
 def random_file(ext):
     return "temp_test_%d.%s" % (random_int(), ext)
+
+
+def expect_status_code(http_response, expected_code):
+    assert http_response.status_code == expected_code, (
+        f"Unexpected status code. {http_response.status_code} != {expected_code}, "
+        f"body: {http_response.text}"
+    )
 
 
 def score_model_in_sagemaker_docker_container(
@@ -78,24 +91,64 @@ def score_model_in_sagemaker_docker_container(
     """
     env = dict(os.environ)
     env.update(LC_ALL="en_US.UTF-8", LANG="en_US.UTF-8")
+    port = get_safe_port()
+    scoring_cmd = (
+        f"mlflow deployments run-local -t sagemaker --name test -m {model_uri}"
+        f" -C image=mlflow-pyfunc -C port={port} --flavor {flavor}"
+    )
     proc = _start_scoring_proc(
-        cmd=["mlflow", "sagemaker", "run-local", "-m", model_uri, "-p", "5000", "-f", flavor],
+        cmd=scoring_cmd.split(" "),
         env=env,
     )
-    return _evaluate_scoring_proc(proc, 5000, data, content_type, activity_polling_timeout_seconds)
+    return _evaluate_scoring_proc(
+        proc, port, data, content_type, activity_polling_timeout_seconds, False
+    )
 
 
-def pyfunc_build_image(model_uri, extra_args=None):
+def pyfunc_generate_dockerfile(output_directory, model_uri=None, extra_args=None, env=None):
+    """
+    Builds a dockerfile for the specified model.
+    :param model_uri: URI of model, e.g. runs:/some-run-id/run-relative/path/to/model
+    :param extra_args: List of extra args to pass to `mlflow models build-docker` command
+    :param output_directory: Output directory to generate Dockerfile and model artifacts
+    """
+    cmd = [
+        "mlflow",
+        "models",
+        "generate-dockerfile",
+        *(["-m", model_uri] if model_uri else []),
+        "-d",
+        output_directory,
+    ]
+    mlflow_home = os.environ.get("MLFLOW_HOME")
+    if mlflow_home:
+        cmd += ["--mlflow-home", mlflow_home]
+    if extra_args:
+        cmd += extra_args
+    subprocess.run(cmd, check=True, env=env)
+
+
+def pyfunc_build_image(model_uri=None, extra_args=None, env=None):
     """
     Builds a docker image containing the specified model, returning the name of the image.
     :param model_uri: URI of model, e.g. runs:/some-run-id/run-relative/path/to/model
     :param extra_args: List of extra args to pass to `mlflow models build-docker` command
     """
     name = uuid.uuid4().hex
-    cmd = ["mlflow", "models", "build-docker", "-m", model_uri, "-n", name]
+    cmd = [
+        "mlflow",
+        "models",
+        "build-docker",
+        *(["-m", model_uri] if model_uri else []),
+        "-n",
+        name,
+    ]
+    mlflow_home = os.environ.get("MLFLOW_HOME")
+    if mlflow_home:
+        cmd += ["--mlflow-home", mlflow_home]
     if extra_args:
         cmd += extra_args
-    p = subprocess.Popen(cmd)
+    p = subprocess.Popen(cmd, env=env)
     assert p.wait() == 0, "Failed to build docker image to serve model from %s" % model_uri
     return name
 
@@ -114,7 +167,7 @@ def pyfunc_serve_from_docker_image(image_name, host_port, extra_args=None):
 
 
 def pyfunc_serve_from_docker_image_with_env_override(
-    image_name, host_port, gunicorn_opts, extra_args=None
+    image_name, host_port, gunicorn_opts, extra_args=None, extra_docker_run_options=None
 ):
     """
     Serves a model from a docker container, exposing it as an endpoint at the specified port
@@ -129,6 +182,7 @@ def pyfunc_serve_from_docker_image_with_env_override(
         "GUNICORN_CMD_ARGS=%s" % gunicorn_opts,
         "-p",
         "%s:8080" % host_port,
+        *(extra_docker_run_options or []),
         image_name,
     ]
     if extra_args is not None:
@@ -172,10 +226,14 @@ def pyfunc_serve_and_score_model(
         str(port),
         "--install-mlflow",
     ]
+    validate_version = True
     if extra_args is not None:
         scoring_cmd += extra_args
+        validate_version = "--enable-mlserver" not in extra_args
     proc = _start_scoring_proc(cmd=scoring_cmd, env=env, stdout=stdout, stderr=stdout)
-    return _evaluate_scoring_proc(proc, port, data, content_type, activity_polling_timeout_seconds)
+    return _evaluate_scoring_proc(
+        proc, port, data, content_type, activity_polling_timeout_seconds, validate_version
+    )
 
 
 def _get_mlflow_home():
@@ -213,15 +271,17 @@ def _start_scoring_proc(cmd, env, stdout=sys.stdout, stderr=sys.stderr):
 
 
 class RestEndpoint:
-    def __init__(self, proc, port, activity_polling_timeout_seconds=250):
+    def __init__(self, proc, port, activity_polling_timeout_seconds=60 * 8, validate_version=True):
         self._proc = proc
         self._port = port
         self._activity_polling_timeout_seconds = activity_polling_timeout_seconds
+        self._validate_version = validate_version
 
     def __enter__(self):
-        for i in range(0, int(self._activity_polling_timeout_seconds / 5)):
+        ping_status = None
+        for i in range(self._activity_polling_timeout_seconds):
             assert self._proc.poll() is None, "scoring process died"
-            time.sleep(5)
+            time.sleep(1)
             # noinspection PyBroadException
             try:
                 ping_status = requests.get(url="http://localhost:%d/ping" % self._port)
@@ -230,9 +290,16 @@ class RestEndpoint:
                     break
             except Exception:
                 _logger.info(f"connection attempt {i} failed, server is not up yet")
-        if ping_status.status_code != 200:
+        if ping_status is None or ping_status.status_code != 200:
             raise Exception("ping failed, server is not happy")
         _logger.info(f"server up, ping status {ping_status}")
+
+        if self._validate_version:
+            resp_status = requests.get(url="http://localhost:%d/version" % self._port)
+            version = resp_status.text
+            _logger.info(f"mlflow server version {version}")
+            if version != mlflow.__version__:
+                raise Exception("version path is not returning correct mlflow version")
         return self
 
     def __exit__(self, tp, val, traceback):
@@ -248,23 +315,18 @@ class RestEndpoint:
                 self._proc.kill()
 
     def invoke(self, data, content_type):
-        import mlflow.pyfunc.scoring_server as pyfunc_scoring_server
         import pandas as pd
+        from mlflow.pyfunc import scoring_server as pyfunc_scoring_server
 
-        if type(data) == pd.DataFrame:
-            if content_type == pyfunc_scoring_server.CONTENT_TYPE_JSON_RECORDS_ORIENTED:
-                data = data.to_json(orient="records")
-            elif (
-                content_type == pyfunc_scoring_server.CONTENT_TYPE_JSON
-                or content_type == pyfunc_scoring_server.CONTENT_TYPE_JSON_SPLIT_ORIENTED
-            ):
-                data = data.to_json(orient="split")
-            elif content_type == pyfunc_scoring_server.CONTENT_TYPE_CSV:
+        if isinstance(data, pd.DataFrame):
+            if content_type == pyfunc_scoring_server.CONTENT_TYPE_CSV:
                 data = data.to_csv(index=False)
             else:
-                raise Exception(
-                    "Unexpected content type for Pandas dataframe input %s" % content_type
-                )
+                assert content_type == pyfunc_scoring_server.CONTENT_TYPE_JSON
+                data = json.dumps({"dataframe_split": data.to_dict(orient="split")})
+        elif type(data) not in {str, dict}:
+            data = json.dumps({"instances": data})
+
         response = requests.post(
             url="http://localhost:%d/invocations" % self._port,
             data=data,
@@ -273,37 +335,24 @@ class RestEndpoint:
         return response
 
 
-def _evaluate_scoring_proc(proc, port, data, content_type, activity_polling_timeout_seconds=250):
+def _evaluate_scoring_proc(
+    proc, port, data, content_type, activity_polling_timeout_seconds=250, validate_version=True
+):
     """
     :param activity_polling_timeout_seconds: The amount of time, in seconds, to wait before
                                              declaring the scoring process to have failed.
     """
-    with RestEndpoint(proc, port, activity_polling_timeout_seconds) as endpoint:
+    with RestEndpoint(
+        proc, port, activity_polling_timeout_seconds, validate_version=validate_version
+    ) as endpoint:
         return endpoint.invoke(data, content_type)
 
 
-@pytest.fixture(scope="module", autouse=True)
-def set_boto_credentials():
-    os.environ["AWS_ACCESS_KEY_ID"] = "NotARealAccessKey"
-    os.environ["AWS_SECRET_ACCESS_KEY"] = "NotARealSecretAccessKey"
-    os.environ["AWS_SESSION_TOKEN"] = "NotARealSessionToken"
-
-
-@pytest.fixture
-def mock_s3_bucket():
-    """
-    Creates a mock S3 bucket using moto
-
-    :return: The name of the mock bucket
-    """
-    import boto3
-    import moto
-
-    with moto.mock_s3():
-        bucket_name = "mock-bucket"
-        s3_client = boto3.client("s3")
-        s3_client.create_bucket(Bucket=bucket_name)
-        yield bucket_name
+@pytest.fixture(scope="function", autouse=True)
+def set_boto_credentials(monkeypatch):
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "NotARealAccessKey")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "NotARealSecretAccessKey")
+    monkeypatch.setenv("AWS_SESSION_TOKEN", "NotARealSessionToken")
 
 
 class safe_edit_yaml:
@@ -323,11 +372,11 @@ class safe_edit_yaml:
 
 def create_mock_response(status_code, text):
     """
-    Create a mock resposne object with the status_code and text
+    Create a mock response object with the status_code and text
 
     :param: status_code int HTTP status code
     :param: text message from the response
-    :reutrn: mock HTTP Response
+    :return: mock HTTP Response
     """
     response = mock.MagicMock()
     response.status_code = status_code
@@ -336,12 +385,12 @@ def create_mock_response(status_code, text):
 
 
 def _read_yaml(path):
-    with open(path, "r") as f:
+    with open(path) as f:
         return yaml.safe_load(f)
 
 
 def _read_lines(path):
-    with open(path, "r") as f:
+    with open(path) as f:
         return f.read().splitlines()
 
 
@@ -357,8 +406,8 @@ def _compare_logged_code_paths(code_path, model_path, flavor_name):
     saved_code_path = os.path.join(model_path, pyfunc_conf[mlflow.pyfunc.CODE])
     assert os.path.exists(saved_code_path)
 
-    with open(os.path.join(saved_code_path, os.path.basename(code_path)), "r") as f1:
-        with open(code_path, "r") as f2:
+    with open(os.path.join(saved_code_path, os.path.basename(code_path))) as f1:
+        with open(code_path) as f2:
             assert f1.read() == f2.read()
 
 
@@ -367,6 +416,15 @@ def _compare_conda_env_requirements(env_path, req_path):
     custom_env_parsed = _read_yaml(env_path)
     requirements = _read_lines(req_path)
     assert _get_pip_deps(custom_env_parsed) == requirements
+
+
+def _get_deps_from_requirement_file(model_uri):
+    """
+    Returns a list of pip dependencies for the model at `model_uri` and truncate the version number.
+    """
+    local_path = _download_artifact_from_uri(model_uri)
+    pip_packages = _read_lines(os.path.join(local_path, _REQUIREMENTS_FILE_NAME))
+    return [req.split("==")[0] if "==" in req else req for req in pip_packages]
 
 
 def _assert_pip_requirements(model_uri, requirements, constraints=None, strict=False):
@@ -404,7 +462,7 @@ def _is_available_on_pypi(package, version=None, module=None):
     """
     from mlflow.utils.requirements_utils import _get_installed_version
 
-    resp = requests.get("https://pypi.python.org/pypi/{}/json".format(package))
+    resp = requests.get(f"https://pypi.python.org/pypi/{package}/json")
     if not resp.ok:
         return False
 
@@ -479,3 +537,82 @@ class StartsWithMatcher:
 class AnyStringWith(str):
     def __eq__(self, other):
         return self in other
+
+
+def assert_array_almost_equal(actual_array, desired_array, rtol=1e-6):
+    import numpy as np
+
+    elem0 = actual_array[0]
+    if isinstance(elem0, numbers.Number) or (
+        isinstance(elem0, (list, np.ndarray)) and isinstance(elem0[0], numbers.Number)
+    ):
+        np.testing.assert_allclose(actual_array, desired_array, rtol=rtol)
+    else:
+        np.testing.assert_array_equal(actual_array, desired_array)
+
+
+def _mlflow_major_version_string():
+    return _generate_mlflow_version_pinning()
+
+
+@contextmanager
+def mock_http_request_200():
+    with mock.patch(
+        "mlflow.utils.rest_utils.http_request",
+        return_value=mock.MagicMock(status_code=200, text="{}"),
+    ) as m:
+        yield m
+
+
+def mock_http_200(f):
+    @functools.wraps(f)
+    @mock.patch(
+        "mlflow.utils.rest_utils.http_request",
+        return_value=mock.MagicMock(status_code=200, text="{}"),
+    )
+    def wrapper(*args, **kwargs):
+        return f(*args, **kwargs)
+
+    return wrapper
+
+
+@contextmanager
+def mock_http_request_403_200():
+    with mock.patch(
+        "mlflow.utils.rest_utils.http_request",
+        side_effect=[
+            mock.MagicMock(status_code=403, text='{"error_code": "ENDPOINT_NOT_FOUND"}'),
+            mock.MagicMock(status_code=200, text="{}"),
+        ],
+    ) as m:
+        yield m
+
+
+def clear_hub_cache():
+    """
+    Frees up disk space for cached huggingface transformers models and components.
+
+    This function will remove all files within the cache if the total size of objects exceeds
+    1 GB on disk. It is used only in CI testing to alleviate the disk burden on the runners as
+    they have limited allocated space and will terminate if the available disk space drops too low.
+    """
+    try:
+        from huggingface_hub import scan_cache_dir
+
+        full_cache = scan_cache_dir()
+        cache_size_in_gb = full_cache.size_on_disk / 1000**3
+
+        if cache_size_in_gb > 1:
+            commits_to_purge = [
+                rev.commit_hash for repo in full_cache.repos for rev in repo.revisions
+            ]
+            delete_strategy = full_cache.delete_revisions(*commits_to_purge)
+            delete_strategy.execute()
+
+    except ImportError:
+        # Local import check for mlflow-skinny not including huggingface_hub
+        pass
+
+
+def get_free_disk_space_in_GiB():
+    return shutil.disk_usage("/").free / (1024**3)

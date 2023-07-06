@@ -4,7 +4,7 @@ from unittest import mock
 
 import mlflow
 from mlflow.exceptions import MlflowException
-from mlflow.tracking.client import MlflowClient
+from mlflow import MlflowClient
 from mlflow.utils import _truncate_dict
 from mlflow.utils.autologging_utils import MlflowAutologgingQueueingClient
 from mlflow.utils.validation import (
@@ -16,11 +16,8 @@ from mlflow.utils.validation import (
 )
 
 
-pytestmark = pytest.mark.large
-
-
 def get_run_data(run_id):
-    client = mlflow.tracking.MlflowClient()
+    client = MlflowClient()
     data = client.get_run(run_id).data
     # Ignore tags mlflow logs by default (e.g. "mlflow.user")
     tags = {k: v for k, v in data.tags.items() if not k.startswith("mlflow.")}
@@ -84,16 +81,14 @@ def test_client_logs_expected_run_data():
     client = MlflowAutologgingQueueingClient()
 
     params_to_log = {
-        "param_key_{}".format(i): "param_val_{}".format(i)
-        for i in range((2 * MAX_PARAMS_TAGS_PER_BATCH) + 1)
+        f"param_key_{i}": f"param_val_{i}" for i in range((2 * MAX_PARAMS_TAGS_PER_BATCH) + 1)
     }
     tags_to_log = {
-        "tag_key_{}".format(i): "tag_val_{}".format(i)
-        for i in range((2 * MAX_PARAMS_TAGS_PER_BATCH) + 1)
+        f"tag_key_{i}": f"tag_val_{i}" for i in range((2 * MAX_PARAMS_TAGS_PER_BATCH) + 1)
     }
-    metrics_to_log = {"metric_key_{}".format(i): i for i in range((4 * MAX_METRICS_PER_BATCH) + 1)}
+    metrics_to_log = {f"metric_key_{i}": i for i in range((4 * MAX_METRICS_PER_BATCH) + 1)}
 
-    with mlflow.start_run() as run:
+    with mlflow.start_run(run_name="my name") as run:
         client.log_params(run_id=run.info.run_id, params=params_to_log)
         client.set_tags(run_id=run.info.run_id, tags=tags_to_log)
         client.log_metrics(run_id=run.info.run_id, metrics=metrics_to_log)
@@ -103,6 +98,7 @@ def test_client_logs_expected_run_data():
     assert run_params == params_to_log
     assert run_metrics == metrics_to_log
     assert run_tags == tags_to_log
+    assert run.info.run_name == "my name"
 
 
 def test_client_logs_metric_steps_correctly():
@@ -275,7 +271,8 @@ def test_logging_failures_are_handled_as_expected():
         # Verify that the run termination operation was still performed successfully
         assert run.info.status == "KILLED"
 
-        assert "Failed to perform one or more operations on the run with ID {run_id}".format(
-            run_id=run.info.run_id
-        ) in str(exc.value)
+        assert (
+            f"Failed to perform one or more operations on the run with ID {run.info.run_id}"
+            in str(exc.value)
+        )
         assert "Batch logging failed!" in str(exc.value)

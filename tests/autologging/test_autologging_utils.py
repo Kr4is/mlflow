@@ -2,6 +2,7 @@
 
 import inspect
 import time
+import sys
 import pytest
 from collections import namedtuple
 from unittest.mock import Mock, call
@@ -9,7 +10,7 @@ from unittest import mock
 
 import mlflow
 from mlflow.utils import gorilla
-from mlflow.tracking.client import MlflowClient
+from mlflow import MlflowClient
 from mlflow.utils.autologging_utils import (
     AUTOLOGGING_INTEGRATIONS,
     log_fn_args_as_params,
@@ -34,9 +35,6 @@ from mlflow.utils.autologging_utils.versioning import (
 )
 
 from tests.autologging.fixtures import test_mode_off
-
-
-pytestmark = pytest.mark.large
 
 
 # Example function signature we are testing on
@@ -94,7 +92,7 @@ def start_run():
     mlflow.end_run()
 
 
-def dummy_fn(arg1, arg2="value2", arg3="value3"):  # pylint: disable=W0613
+def dummy_fn(arg1, arg2="value2", arg3="value3"):  # pylint: disable=unused-argument
     pass
 
 
@@ -112,20 +110,24 @@ log_test_args = [
 ]
 
 
-@pytest.mark.parametrize("args,kwargs,expected", log_test_args)
-def test_log_fn_args_as_params(args, kwargs, expected, start_run):  # pylint: disable=W0613
+@pytest.mark.parametrize(("args", "kwargs", "expected"), log_test_args)
+def test_log_fn_args_as_params(
+    args, kwargs, expected, start_run
+):  # pylint: disable=unused-argument
     log_fn_args_as_params(dummy_fn, args, kwargs)
-    client = mlflow.tracking.MlflowClient()
+    client = MlflowClient()
     params = client.get_run(mlflow.active_run().info.run_id).data.params
     for arg, value in zip(["arg1", "arg2", "arg3"], expected):
         assert arg in params
         assert params[arg] == value
 
 
-def test_log_fn_args_as_params_ignores_unwanted_parameters(start_run):  # pylint: disable=W0613
+def test_log_fn_args_as_params_ignores_unwanted_parameters(
+    start_run,
+):  # pylint: disable=unused-argument
     args, kwargs, unlogged = ("arg1", {"arg2": "value"}, ["arg1", "arg2", "arg3"])
     log_fn_args_as_params(dummy_fn, args, kwargs, unlogged)
-    client = mlflow.tracking.MlflowClient()
+    client = MlflowClient()
     params = client.get_run(mlflow.active_run().info.run_id).data.params
     assert len(params.keys()) == 0
 
@@ -157,8 +159,6 @@ def sample_function_to_patch(a, b):
 
 
 def test_wrap_patch_with_module():
-    import sys
-
     this_module = sys.modules[__name__]
 
     def new_sample_function(a, b):
@@ -217,7 +217,9 @@ def test_if_model_signature_inference_fails(logger):
     )
 
     assert input_example == "data"
-    assert signature is None
+    # When the signature inference fails but an input example is specified, `signature` is set
+    # to `False` to disable the automatic signature inference feature in `log_model` APIs.
+    assert signature is False
     logger.warning.assert_called_with("Failed to infer model signature: " + error_msg)
 
 
@@ -267,7 +269,7 @@ def test_batch_metrics_logger_logs_all_metrics(start_run):
         for i in range(100):
             metrics_logger.record_metrics({hex(i): i}, i)
 
-    metrics_on_run = mlflow.tracking.MlflowClient().get_run(run_id).data.metrics
+    metrics_on_run = MlflowClient().get_run(run_id).data.metrics
 
     for i in range(100):
         assert hex(i) in metrics_on_run
@@ -285,13 +287,13 @@ def test_batch_metrics_logger_flush_logs_to_mlflow(start_run):
         metrics_logger.record_metrics({"my_metric": 10}, 5)
 
         # Recorded metrics should not be logged to mlflow run before flushing BatchMetricsLogger
-        metrics_on_run = mlflow.tracking.MlflowClient().get_run(run_id).data.metrics
+        metrics_on_run = MlflowClient().get_run(run_id).data.metrics
         assert "my_metric" not in metrics_on_run
 
         metrics_logger.flush()
 
         # Recorded metric should be logged to mlflow run after flushing BatchMetricsLogger
-        metrics_on_run = mlflow.tracking.MlflowClient().get_run(run_id).data.metrics
+        metrics_on_run = MlflowClient().get_run(run_id).data.metrics
         assert "my_metric" in metrics_on_run
         assert metrics_on_run["my_metric"] == 10
 
@@ -467,7 +469,6 @@ def test_autologging_integration_makes_expected_event_logging_calls():
         raise Exception("autolog failed")
 
     class TestLogger(AutologgingEventLogger):
-
         LoggerCall = namedtuple("LoggerCall", ["integration", "call_args", "call_kwargs"])
 
         def __init__(self):
@@ -527,7 +528,6 @@ def test_autologging_integration_succeeds_when_event_logging_throws_in_standard_
 
 
 def test_get_autologging_config_returns_configured_values_or_defaults_as_expected():
-
     assert get_autologging_config("nonexistent_integration", "foo") is None
 
     @autologging_integration("test_integration_for_config")
@@ -555,7 +555,6 @@ def test_get_autologging_config_returns_configured_values_or_defaults_as_expecte
 
 
 def test_autologging_is_disabled_returns_expected_values():
-
     assert autologging_is_disabled("nonexistent_integration") is True
 
     @autologging_integration("test_integration_for_disable_check")
@@ -717,6 +716,10 @@ _module_version_info_dict_patch = {
         "package_info": {"pip_release": "pytorch-lightning"},
         "autologging": {"minimum": "1.0.5", "maximum": "1.1.2"},
     },
+    "pytorch": {
+        "package_info": {"pip_release": "torch"},
+        "autologging": {"minimum": "1.6.0", "maximum": "1.13.1"},
+    },
     "tensorflow": {
         "package_info": {"pip_release": "tensorflow"},
         "autologging": {"minimum": "1.15.4", "maximum": "2.3.1"},
@@ -749,11 +752,15 @@ _module_version_info_dict_patch = {
         "package_info": {"pip_release": "pyspark"},
         "autologging": {"minimum": "3.0.1", "maximum": "3.1.1"},
     },
+    "transformers": {
+        "package_info": {"pip_release": "transformers"},
+        "autologging": {"minimum": "1.25.1", "maximum": "1.28.1"},
+    },
 }
 
 
 @pytest.mark.parametrize(
-    "flavor,module_version,expected_result",
+    ("flavor", "module_version", "expected_result"),
     [
         ("fastai", "2.4.1", True),
         ("fastai", "2.3.1", False),
@@ -775,14 +782,16 @@ _module_version_info_dict_patch = {
         ("sklearn", "0.23.0rc1", False),
         ("sklearn", "0.23.0dev0", False),
         ("sklearn", "0.23.0-SNAPSHOT", False),
-        ("pytorch", "1.0.5", True),
-        ("pytorch", "1.0.4", False),
+        ("pytorch", "1.6.0", True),
+        ("pytorch", "1.5.99", False),
         ("pyspark.ml", "3.1.0", True),
         ("pyspark.ml", "3.0.0", False),
+        ("transformers", "1.28.1", True),
+        ("transformers", "1.1.1", False),
     ],
 )
 @mock.patch(
-    "mlflow.utils.autologging_utils.versioning._module_version_info_dict",
+    "mlflow.utils.autologging_utils.versioning._ML_PACKAGE_VERSIONS",
     _module_version_info_dict_patch,
 )
 def test_is_autologging_integration_supported(flavor, module_version, expected_result):
@@ -792,7 +801,7 @@ def test_is_autologging_integration_supported(flavor, module_version, expected_r
 
 
 @pytest.mark.parametrize(
-    "flavor,module_version,expected_result",
+    ("flavor", "module_version", "expected_result"),
     [
         ("pyspark.ml", "3.10.1.dev0", False),
         ("pyspark.ml", "3.3.0.dev0", True),
@@ -803,7 +812,7 @@ def test_is_autologging_integration_supported(flavor, module_version, expected_r
     ],
 )
 @mock.patch(
-    "mlflow.utils.autologging_utils.versioning._module_version_info_dict",
+    "mlflow.utils.autologging_utils.versioning._ML_PACKAGE_VERSIONS",
     _module_version_info_dict_patch,
 )
 def test_dev_version_pyspark_is_supported_in_databricks(flavor, module_version, expected_result):
@@ -822,7 +831,7 @@ def test_dev_version_pyspark_is_supported_in_databricks(flavor, module_version, 
 
 
 @mock.patch(
-    "mlflow.utils.autologging_utils.versioning._module_version_info_dict",
+    "mlflow.utils.autologging_utils.versioning._ML_PACKAGE_VERSIONS",
     _module_version_info_dict_patch,
 )
 def test_disable_for_unsupported_versions_warning_sklearn_integration():
@@ -908,10 +917,10 @@ def test_get_instance_method_first_arg_value():
         def f4(self, *args, **kwargs):
             pass
 
-    assert 3 == get_instance_method_first_arg_value(Test.f1, [3, 4], {})
-    assert 3 == get_instance_method_first_arg_value(Test.f1, [3], {"cd2": 4})
-    assert 3 == get_instance_method_first_arg_value(Test.f1, [], {"ab1": 3, "cd2": 4})
-    assert 3 == get_instance_method_first_arg_value(Test.f2, [3, 4], {})
+    assert get_instance_method_first_arg_value(Test.f1, [3, 4], {}) == 3
+    assert get_instance_method_first_arg_value(Test.f1, [3], {"cd2": 4}) == 3
+    assert get_instance_method_first_arg_value(Test.f1, [], {"ab1": 3, "cd2": 4}) == 3
+    assert get_instance_method_first_arg_value(Test.f2, [3, 4], {}) == 3
     with pytest.raises(AssertionError, match=""):
         get_instance_method_first_arg_value(Test.f3, [], {"ab1": 3, "cd2": 4})
     with pytest.raises(AssertionError, match=""):
@@ -920,6 +929,6 @@ def test_get_instance_method_first_arg_value():
 
 def test_get_method_call_arg_value():
     # suppose we call on a method defined like: `def f1(a, b=3, *, c=4, e=5)`
-    assert 2 == get_method_call_arg_value(1, "b", 3, [1, 2], {})
-    assert 3 == get_method_call_arg_value(1, "b", 3, [1], {})
-    assert 2 == get_method_call_arg_value(1, "b", 3, [1], {"b": 2})
+    assert get_method_call_arg_value(1, "b", 3, [1, 2], {}) == 2
+    assert get_method_call_arg_value(1, "b", 3, [1], {}) == 3
+    assert get_method_call_arg_value(1, "b", 3, [1], {"b": 2}) == 2

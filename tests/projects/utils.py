@@ -1,5 +1,6 @@
 import filecmp
 import os
+import shutil
 
 
 import pytest
@@ -12,8 +13,15 @@ from mlflow.projects import _project_spec
 
 
 TEST_DIR = "tests"
-TEST_PROJECT_DIR = os.path.join(TEST_DIR, "resources", "example_project")
+TEST_PROJECT_DIR = os.path.abspath(os.path.join(TEST_DIR, "resources", "example_project"))
 TEST_DOCKER_PROJECT_DIR = os.path.join(TEST_DIR, "resources", "example_docker_project")
+TEST_VIRTUALENV_PROJECT_DIR = os.path.join(TEST_DIR, "resources", "example_virtualenv_project")
+TEST_VIRTUALENV_CONDA_PROJECT_DIR = os.path.join(
+    TEST_DIR, "resources", "example_virtualenv_conda_project"
+)
+TEST_VIRTUALENV_NO_PYTHON_ENV = os.path.join(
+    TEST_DIR, "resources", "example_virtualenv_no_python_env"
+)
 TEST_PROJECT_NAME = "example_project"
 TEST_NO_SPEC_PROJECT_DIR = os.path.join(TEST_DIR, "resources", "example_project_no_spec")
 GIT_PROJECT_URI = "https://github.com/mlflow/mlflow-example"
@@ -54,15 +62,9 @@ def docker_example_base_image():
     with TempDir() as tmp:
         cwd = tmp.path()
         mlflow_dir = _copy_project(src_path=mlflow_home, dst_path=cwd)
-        import shutil
-
         shutil.copy(os.path.join(TEST_DOCKER_PROJECT_DIR, "Dockerfile"), tmp.path("Dockerfile"))
         with open(tmp.path("Dockerfile"), "a") as f:
-            f.write(
-                ("COPY {mlflow_dir} /opt/mlflow\n" "RUN pip install -U -e /opt/mlflow\n").format(
-                    mlflow_dir=mlflow_dir
-                )
-            )
+            f.write(f"COPY {mlflow_dir} /opt/mlflow\nRUN pip install -U -e /opt/mlflow\n")
 
         client = docker.from_env()
         try:

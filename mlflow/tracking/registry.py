@@ -12,12 +12,12 @@ class UnsupportedModelRegistryStoreURIException(MlflowException):
 
     def __init__(self, unsupported_uri, supported_uri_schemes):
         message = (
-            " Model registry functionality is unavailable; got unsupported URI '{}' for"
-            " model registry data storage. Supported URI schemes are: {}."
-            " See https://www.mlflow.org/docs/latest/tracking.html#storage for"
-            " how to run an MLflow server against one of the supported backend storage"
-            " locations."
-        ).format(unsupported_uri, supported_uri_schemes)
+            " Model registry functionality is unavailable; got unsupported URI"
+            f" '{unsupported_uri}' for model registry data storage. Supported URI schemes are:"
+            f" {supported_uri_schemes}."
+            " See https://www.mlflow.org/docs/latest/tracking.html#storage for how to run"
+            " an MLflow server against one of the supported backend storage locations."
+        )
         super().__init__(message, error_code=INVALID_PARAMETER_VALUE)
         self.supported_uri_schemes = supported_uri_schemes
 
@@ -70,8 +70,9 @@ class StoreRegistry:
                  ``mlflow.store.{tracking|model_registry}.AbstractStore`` that fulfills the store
                   URI requirements.
         """
-        scheme = store_uri if store_uri == "databricks" else get_uri_scheme(store_uri)
-
+        scheme = (
+            store_uri if store_uri in {"databricks", "databricks-uc"} else get_uri_scheme(store_uri)
+        )
         try:
             store_builder = self._registry[scheme]
         except KeyError:

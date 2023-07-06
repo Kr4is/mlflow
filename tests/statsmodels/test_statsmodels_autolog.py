@@ -3,8 +3,8 @@ from unittest import mock
 import numpy as np
 from statsmodels.tsa.base.tsa_model import TimeSeriesModel
 import mlflow
+from mlflow import MlflowClient
 import mlflow.statsmodels
-from mlflow.tracking.client import MlflowClient
 from tests.statsmodels.model_fixtures import (
     arma_model,
     ols_model,
@@ -25,8 +25,8 @@ from tests.statsmodels.test_statsmodels_model_export import _get_dates_from_df
 
 
 def get_latest_run():
-    client = mlflow.tracking.MlflowClient()
-    return client.get_run(client.list_run_infos(experiment_id="0")[0].run_id)
+    client = MlflowClient()
+    return client.get_run(client.search_runs(["0"])[0].info.run_id)
 
 
 def test_statsmodels_autolog_ends_auto_created_run():
@@ -84,7 +84,7 @@ def test_statsmodels_autolog_logs_summary_artifact():
     with mlflow.start_run():
         model = ols_model().model
         summary_path = mlflow.get_artifact_uri("model_summary.txt").replace("file://", "")
-        with open(summary_path, "r") as f:
+        with open(summary_path) as f:
             saved_summary = f.read()
 
     # don't compare the whole summary text because it includes a "Time" field which may change.
@@ -157,25 +157,23 @@ def test_statsmodels_autolog_works_after_exception():
 
     run = get_latest_run()
     run_id = run.info.run_id
-    loaded_model = mlflow.statsmodels.load_model("runs:/{}/model".format(run_id))
+    loaded_model = mlflow.statsmodels.load_model(f"runs:/{run_id}/model")
 
     model_predictions = model_with_results.model.predict(model_with_results.inference_dataframe)
     loaded_model_predictions = loaded_model.predict(model_with_results.inference_dataframe)
     np.testing.assert_array_almost_equal(model_predictions, loaded_model_predictions)
 
 
-@pytest.mark.large
 @pytest.mark.parametrize("log_models", [True, False])
 def test_statsmodels_autolog_respects_log_models_flag(log_models):
     mlflow.statsmodels.autolog(log_models=log_models)
     ols_model()
     run = get_latest_run()
-    client = mlflow.tracking.MlflowClient()
+    client = MlflowClient()
     artifact_paths = [artifact.path for artifact in client.list_artifacts(run.info.run_id)]
     assert ("model" in artifact_paths) == log_models
 
 
-@pytest.mark.large
 def test_statsmodels_autolog_loads_model_from_artifact():
     mlflow.statsmodels.autolog()
     fixtures = [
@@ -195,10 +193,9 @@ def test_statsmodels_autolog_loads_model_from_artifact():
         model_with_results = algorithm()
         run = get_latest_run()
         run_id = run.info.run_id
-        loaded_model = mlflow.statsmodels.load_model("runs:/{}/model".format(run_id))
+        loaded_model = mlflow.statsmodels.load_model(f"runs:/{run_id}/model")
 
         if hasattr(model_with_results.model, "predict"):
-
             if isinstance(model_with_results.alg, TimeSeriesModel):
                 start_date, end_date = _get_dates_from_df(model_with_results.inference_dataframe)
                 model_predictions = model_with_results.model.predict(start_date, end_date)
@@ -214,7 +211,6 @@ def test_statsmodels_autolog_loads_model_from_artifact():
             np.testing.assert_array_almost_equal(model_predictions, loaded_model_predictions)
 
 
-@pytest.mark.large
 def test_autolog_registering_model():
     registered_model_name = "test_autolog_registered_model"
     mlflow.statsmodels.autolog(registered_model_name=registered_model_name)

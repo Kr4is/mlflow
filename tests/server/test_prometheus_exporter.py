@@ -8,8 +8,8 @@ from mlflow.server.prometheus_exporter import activate_prometheus_exporter
 
 
 @pytest.fixture(autouse=True)
-def mock_settings_env_vars(tmpdir):
-    with mock.patch.dict(os.environ, {"PROMETHEUS_MULTIPROC_DIR": tmpdir.strpath}):
+def mock_settings_env_vars(tmp_path):
+    with mock.patch.dict(os.environ, {"PROMETHEUS_MULTIPROC_DIR": str(tmp_path)}):
         yield
 
 
@@ -51,6 +51,13 @@ def test_metrics(app, test_client):
 
     # calling the health endpoint should not increment the counter
     resp = test_client.get("/health")
+    assert resp.status_code == 200
+    assert (
+        metrics.registry.get_sample_value("mlflow_http_request_total", labels=success_labels) == 1
+    )
+
+    # calling the version endpoint should not increment the counter
+    resp = test_client.get("/version")
     assert resp.status_code == 200
     assert (
         metrics.registry.get_sample_value("mlflow_http_request_total", labels=success_labels) == 1

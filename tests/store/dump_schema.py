@@ -1,6 +1,5 @@
 """Script that generates a dump of the MLflow tracking database schema"""
 import os
-import shutil
 import sys
 
 import sqlalchemy
@@ -12,8 +11,8 @@ from mlflow.store.tracking.sqlalchemy_store import SqlAlchemyStore
 
 def dump_db_schema(db_url, dst_file):
     engine = sqlalchemy.create_engine(db_url)
-    created_tables_metadata = MetaData(bind=engine)
-    created_tables_metadata.reflect()
+    created_tables_metadata = MetaData()
+    created_tables_metadata.reflect(bind=engine)
     # Write out table schema as described in
     # https://docs.sqlalchemy.org/en/13/faq/
     # metadata_schema.html#how-can-i-get-the-create-table-drop-table-output-as-a-string
@@ -27,14 +26,11 @@ def dump_db_schema(db_url, dst_file):
 
 
 def dump_sqlalchemy_store_schema(dst_file):
-    db_tmpdir = tempfile.mkdtemp()
-    try:
+    with tempfile.TemporaryDirectory() as db_tmpdir:
         path = os.path.join(db_tmpdir, "db_file")
         db_url = "sqlite:///%s" % path
         SqlAlchemyStore(db_url, db_tmpdir)
         dump_db_schema(db_url, dst_file)
-    finally:
-        shutil.rmtree(db_tmpdir)
 
 
 if __name__ == "__main__":

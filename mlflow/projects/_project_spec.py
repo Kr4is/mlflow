@@ -1,15 +1,16 @@
 """Internal utilities for parsing MLproject YAML files."""
 
 import os
-from shlex import quote
 import yaml
 
-from mlflow import data
 from mlflow.exceptions import ExecutionException
 from mlflow.tracking import artifact_utils
+from mlflow.utils import data_utils
 from mlflow.utils.file_utils import get_local_path_or_none
 from mlflow.utils.string_utils import is_string_type
-
+from mlflow.utils.environment import _PYTHON_ENV_FILE_NAME
+from mlflow.utils.string_utils import quote
+from mlflow.projects import env_type
 
 MLPROJECT_FILE_NAME = "mlproject"
 DEFAULT_CONDA_FILE_NAME = "conda.yaml"
@@ -33,7 +34,7 @@ def load_project(directory):
             yaml_obj = yaml.safe_load(mlproject_file)
 
     # Validate the project config does't contain multiple environment fields
-    env_fields = set(yaml_obj.keys()).intersection({"conda_env", "docker_env"})
+    env_fields = set(yaml_obj.keys()).intersection(env_type.ALL)
     if len(env_fields) > 1:
         raise ExecutionException(
             f"Project cannot contain multiple environment fields: {env_fields}"
@@ -41,8 +42,15 @@ def load_project(directory):
 
     project_name = yaml_obj.get("name")
 
+    # Parse entry points
+    entry_points = {}
+    for name, entry_point_yaml in yaml_obj.get("entry_points", {}).items():
+        parameters = entry_point_yaml.get("parameters", {})
+        command = entry_point_yaml.get("command")
+        entry_points[name] = EntryPoint(name, parameters, command)
+
     # Validate config if docker_env parameter is present
-    docker_env = yaml_obj.get("docker_env")
+    docker_env = yaml_obj.get(env_type.DOCKER)
     if docker_env:
         if not docker_env.get("image"):
             raise ExecutionException(
@@ -62,9 +70,7 @@ def load_project(directory):
         if docker_env.get("environment"):
             if not (
                 isinstance(docker_env["environment"], list)
-                and all(
-                    isinstance(i, list) or isinstance(i, str) for i in docker_env["environment"]
-                )
+                and all(isinstance(i, (list, str)) for i in docker_env["environment"])
             ):
                 raise ExecutionException(
                     "Project configuration (MLproject file) was invalid: "
@@ -73,15 +79,31 @@ def load_project(directory):
                     "environment variables)."
                     """E.g.: '[["NEW_VAR", "new_value"], "VAR_TO_COPY_FROM_HOST"])"""
                 )
+        return Project(
+            env_type=env_type.DOCKER,
+            env_config_path=None,
+            entry_points=entry_points,
+            docker_env=docker_env,
+            name=project_name,
+        )
 
-    # Parse entry points
-    entry_points = {}
-    for name, entry_point_yaml in yaml_obj.get("entry_points", {}).items():
-        parameters = entry_point_yaml.get("parameters", {})
-        command = entry_point_yaml.get("command")
-        entry_points[name] = EntryPoint(name, parameters, command)
+    python_env = yaml_obj.get(env_type.PYTHON)
+    if python_env:
+        python_env_path = os.path.join(directory, python_env)
+        if not os.path.exists(python_env_path):
+            raise ExecutionException(
+                "Project specified python_env file %s, but no such "
+                "file was found." % python_env_path
+            )
+        return Project(
+            env_type=env_type.PYTHON,
+            env_config_path=python_env_path,
+            entry_points=entry_points,
+            docker_env=None,
+            name=project_name,
+        )
 
-    conda_path = yaml_obj.get("conda_env")
+    conda_path = yaml_obj.get(env_type.CONDA)
     if conda_path:
         conda_env_path = os.path.join(directory, conda_path)
         if not os.path.exists(conda_env_path):
@@ -90,31 +112,48 @@ def load_project(directory):
                 "file was found." % conda_env_path
             )
         return Project(
-            conda_env_path=conda_env_path,
+            env_type=env_type.CONDA,
+            env_config_path=conda_env_path,
             entry_points=entry_points,
-            docker_env=docker_env,
+            docker_env=None,
+            name=project_name,
+        )
+
+    default_python_env_path = os.path.join(directory, _PYTHON_ENV_FILE_NAME)
+    if os.path.exists(default_python_env_path):
+        return Project(
+            env_type=env_type.PYTHON,
+            env_config_path=default_python_env_path,
+            entry_points=entry_points,
+            docker_env=None,
             name=project_name,
         )
 
     default_conda_path = os.path.join(directory, DEFAULT_CONDA_FILE_NAME)
     if os.path.exists(default_conda_path):
         return Project(
-            conda_env_path=default_conda_path,
+            env_type=env_type.CONDA,
+            env_config_path=default_conda_path,
             entry_points=entry_points,
-            docker_env=docker_env,
+            docker_env=None,
             name=project_name,
         )
 
     return Project(
-        conda_env_path=None, entry_points=entry_points, docker_env=docker_env, name=project_name
+        env_type=env_type.PYTHON,
+        env_config_path=None,
+        entry_points=entry_points,
+        docker_env=None,
+        name=project_name,
     )
 
 
 class Project:
     """A project specification loaded from an MLproject file in the passed-in directory."""
 
-    def __init__(self, conda_env_path, entry_points, docker_env, name):
-        self.conda_env_path = conda_env_path
+    def __init__(self, env_type, env_config_path, entry_points, docker_env, name):
+        self.env_type = env_type
+        self.env_config_path = env_config_path
         self._entry_points = entry_points
         self.docker_env = docker_env
         self.name = name
@@ -125,7 +164,7 @@ class Project:
         _, file_extension = os.path.splitext(entry_point)
         ext_to_cmd = {".py": "python", ".sh": os.environ.get("SHELL", "bash")}
         if file_extension in ext_to_cmd:
-            command = "%s %s" % (ext_to_cmd[file_extension], quote(entry_point))
+            command = f"{ext_to_cmd[file_extension]} {quote(entry_point)}"
             if not is_string_type(command):
                 command = command.encode("utf-8")
             return EntryPoint(name=entry_point, parameters={}, command=command)
@@ -194,7 +233,7 @@ class EntryPoint:
         params, extra_params = self.compute_parameters(user_parameters, storage_dir)
         command_with_params = self.command.format(**params)
         command_arr = [command_with_params]
-        command_arr.extend(["--%s %s" % (key, value) for key, value in extra_params.items()])
+        command_arr.extend([f"--{key} {value}" for key, value in extra_params.items()])
         return " ".join(command_arr)
 
     @staticmethod
@@ -215,9 +254,9 @@ class Parameter:
             self.default = yaml_obj.get("default")
 
     def _compute_uri_value(self, user_param_value):
-        if not data.is_uri(user_param_value):
+        if not data_utils.is_uri(user_param_value):
             raise ExecutionException(
-                "Expected URI for parameter %s but got %s" % (self.name, user_param_value)
+                f"Expected URI for parameter {self.name} but got {user_param_value}"
             )
         return user_param_value
 
@@ -226,11 +265,11 @@ class Parameter:
         if local_path:
             if not os.path.exists(local_path):
                 raise ExecutionException(
-                    "Got value %s for parameter %s, but no such file or "
-                    "directory was found." % (user_param_value, self.name)
+                    f"Got value {user_param_value} for parameter {self.name}, but no such file or "
+                    "directory was found."
                 )
             return os.path.abspath(local_path)
-        target_sub_dir = "param_{}".format(key_position)
+        target_sub_dir = f"param_{key_position}"
         download_dir = os.path.join(storage_dir, target_sub_dir)
         os.mkdir(download_dir)
         return artifact_utils._download_artifact_from_uri(

@@ -1,21 +1,30 @@
-import os
 from functools import partial
 
 from mlflow.store.db.db_types import DATABASE_ENGINES
+from mlflow.store.model_registry.file_store import FileStore
 from mlflow.store.model_registry.rest_store import RestStore
+from mlflow.store.model_registry.databricks_workspace_model_registry_rest_store import (
+    DatabricksWorkspaceModelRegistryRestStore,
+)
+from mlflow.store._unity_catalog.registry.rest_store import UcModelRegistryStore
 from mlflow.tracking._model_registry.registry import ModelRegistryStoreRegistry
 from mlflow.tracking._tracking_service.utils import (
-    _TRACKING_USERNAME_ENV_VAR,
-    _TRACKING_PASSWORD_ENV_VAR,
-    _TRACKING_TOKEN_ENV_VAR,
-    _TRACKING_INSECURE_TLS_ENV_VAR,
-    _TRACKING_CLIENT_CERT_PATH_ENV_VAR,
-    _TRACKING_SERVER_CERT_PATH_ENV_VAR,
     _resolve_tracking_uri,
     get_tracking_uri,
 )
 from mlflow.utils import rest_utils
 from mlflow.utils.databricks_utils import get_databricks_host_creds
+from mlflow.utils.uri import _DATABRICKS_UNITY_CATALOG_SCHEME
+from mlflow.environment_variables import (
+    MLFLOW_TRACKING_AWS_SIGV4,
+    MLFLOW_TRACKING_USERNAME,
+    MLFLOW_TRACKING_PASSWORD,
+    MLFLOW_TRACKING_TOKEN,
+    MLFLOW_TRACKING_INSECURE_TLS,
+    MLFLOW_TRACKING_SERVER_CERT_PATH,
+    MLFLOW_TRACKING_CLIENT_CERT_PATH,
+    MLFLOW_REGISTRY_URI,
+)
 
 
 # NOTE: in contrast to tracking, we do not support the following ways to specify
@@ -80,6 +89,10 @@ def set_registry_uri(uri: str) -> None:
 def _get_registry_uri_from_context():
     global _registry_uri
     # in the future, REGISTRY_URI env var support can go here
+    if _registry_uri is not None:
+        return _registry_uri
+    elif uri := MLFLOW_REGISTRY_URI.get():
+        return uri
     return _registry_uri
 
 
@@ -125,12 +138,13 @@ def _get_sqlalchemy_store(store_uri):
 def get_default_host_creds(store_uri):
     return rest_utils.MlflowHostCreds(
         host=store_uri,
-        username=os.environ.get(_TRACKING_USERNAME_ENV_VAR),
-        password=os.environ.get(_TRACKING_PASSWORD_ENV_VAR),
-        token=os.environ.get(_TRACKING_TOKEN_ENV_VAR),
-        ignore_tls_verification=os.environ.get(_TRACKING_INSECURE_TLS_ENV_VAR) == "true",
-        client_cert_path=os.environ.get(_TRACKING_CLIENT_CERT_PATH_ENV_VAR),
-        server_cert_path=os.environ.get(_TRACKING_SERVER_CERT_PATH_ENV_VAR),
+        username=MLFLOW_TRACKING_USERNAME.get(),
+        password=MLFLOW_TRACKING_PASSWORD.get(),
+        token=MLFLOW_TRACKING_TOKEN.get(),
+        aws_sigv4=MLFLOW_TRACKING_AWS_SIGV4.get(),
+        ignore_tls_verification=MLFLOW_TRACKING_INSECURE_TLS.get(),
+        client_cert_path=MLFLOW_TRACKING_CLIENT_CERT_PATH.get(),
+        server_cert_path=MLFLOW_TRACKING_SERVER_CERT_PATH.get(),
     )
 
 
@@ -139,12 +153,16 @@ def _get_rest_store(store_uri, **_):
 
 
 def _get_databricks_rest_store(store_uri, **_):
-    return RestStore(partial(get_databricks_host_creds, store_uri))
+    return DatabricksWorkspaceModelRegistryRestStore(partial(get_databricks_host_creds, store_uri))
 
 
 # We define the global variable as `None` so that instantiating the store does not lead to circular
 # dependency issues.
 _model_registry_store_registry = None
+
+
+def _get_file_store(store_uri, **_):
+    return FileStore(store_uri)
 
 
 def _get_store_registry():
@@ -154,6 +172,9 @@ def _get_store_registry():
 
     _model_registry_store_registry = ModelRegistryStoreRegistry()
     _model_registry_store_registry.register("databricks", _get_databricks_rest_store)
+    # Register a placeholder function that raises if users pass a registry URI with scheme
+    # "databricks-uc"
+    _model_registry_store_registry.register(_DATABRICKS_UNITY_CATALOG_SCHEME, UcModelRegistryStore)
 
     for scheme in ["http", "https"]:
         _model_registry_store_registry.register(scheme, _get_rest_store)
@@ -161,9 +182,12 @@ def _get_store_registry():
     for scheme in DATABASE_ENGINES:
         _model_registry_store_registry.register(scheme, _get_sqlalchemy_store)
 
+    for scheme in ["", "file"]:
+        _model_registry_store_registry.register(scheme, _get_file_store)
+
     _model_registry_store_registry.register_entrypoints()
     return _model_registry_store_registry
 
 
-def _get_store(store_uri=None):
-    return _get_store_registry().get_store(store_uri)
+def _get_store(store_uri=None, tracking_uri=None):
+    return _get_store_registry().get_store(store_uri, tracking_uri)

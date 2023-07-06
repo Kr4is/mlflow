@@ -1,3 +1,8 @@
-pylint==2.11.1
-rstcheck==3.2
-black==22.3.0
+pylint==2.14.4
+ruff==0.0.275
+rstcheck==6.1.1
+black[jupyter]==23.3.0
+# Use harupy's fork until https://github.com/adamchainz/blacken-docs/issues/214 is resolved
+# to format code in test-code-blocks
+blacken-docs@git+https://github.com/harupy/blacken-docs.git@test-code-block
+pre-commit==2.20.0

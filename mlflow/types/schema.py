@@ -2,18 +2,11 @@ import json
 from enum import Enum
 
 import numpy as np
-import pandas as pd
 import string
 from typing import Dict, Any, List, Union, Optional
 
 from mlflow.exceptions import MlflowException
-
-
-def _pandas_string_type():
-    try:
-        return pd.StringDtype()
-    except AttributeError:
-        return object
+from mlflow.utils.annotations import experimental
 
 
 class DataType(Enum):
@@ -43,11 +36,11 @@ class DataType(Enum):
     """32b floating point numbers. """
     double = (5, np.dtype("float64"), "DoubleType")
     """64b floating point numbers. """
-    string = (6, np.dtype("str"), "StringType", _pandas_string_type())
+    string = (6, np.dtype("str"), "StringType", object)
     """Text data."""
     binary = (7, np.dtype("bytes"), "BinaryType", object)
     """Sequence of raw bytes."""
-    datetime = (8, np.dtype("datetime64"), "TimestampType")
+    datetime = (8, np.dtype("datetime64[ns]"), "TimestampType")
     """64b datetime data."""
 
     def __repr__(self):
@@ -66,6 +59,10 @@ class DataType(Enum):
 
         return getattr(pyspark.sql.types, self._spark_type)()
 
+    @classmethod
+    def get_spark_types(cls):
+        return [dt.to_spark() for dt in cls._member_map_.values()]
+
 
 class ColSpec:
     """
@@ -73,20 +70,24 @@ class ColSpec:
     """
 
     def __init__(
-        self, type: DataType, name: Optional[str] = None  # pylint: disable=redefined-builtin
+        self,
+        type: Union[DataType, str],  # pylint: disable=redefined-builtin
+        name: Optional[str] = None,
+        optional: bool = False,
     ):
         self._name = name
+        self._optional = optional
         try:
             self._type = DataType[type] if isinstance(type, str) else type
         except KeyError:
             raise MlflowException(
-                "Unsupported type '{0}', expected instance of DataType or "
-                "one of {1}".format(type, [t.name for t in DataType])
+                "Unsupported type '{}', expected instance of DataType or "
+                "one of {}".format(type, [t.name for t in DataType])
             )
         if not isinstance(self.type, DataType):
             raise TypeError(
                 "Expected mlflow.models.signature.Datatype or str for the 'type' "
-                "argument, but got {}".format(self.type.__class__)
+                f"argument, but got {self.type.__class__}"
             )
 
     @property
@@ -99,23 +100,35 @@ class ColSpec:
         """The column name or None if the columns is unnamed."""
         return self._name
 
+    @experimental
+    @property
+    def optional(self) -> bool:
+        """Whether this column is optional."""
+        return self._optional
+
     def to_dict(self) -> Dict[str, Any]:
-        if self.name is None:
-            return {"type": self.type.name}
-        else:
-            return {"name": self.name, "type": self.type.name}
+        d = {"type": self.type.name}
+        if self.name is not None:
+            d["name"] = self.name
+        if self.optional:
+            d["optional"] = self.optional
+        return d
 
     def __eq__(self, other) -> bool:
         if isinstance(other, ColSpec):
             names_eq = (self.name is None and other.name is None) or self.name == other.name
-            return names_eq and self.type == other.type
+            return names_eq and self.type == other.type and self.optional == other.optional
         return False
 
     def __repr__(self) -> str:
         if self.name is None:
             return repr(self.type)
         else:
-            return "{name}: {type}".format(name=repr(self.name), type=repr(self.type))
+            return "{name}: {type}{optional}".format(
+                name=repr(self.name),
+                type=repr(self.type),
+                optional=" (optional)" if self.optional else "",
+            )
 
 
 class TensorInfo:
@@ -126,20 +139,18 @@ class TensorInfo:
     def __init__(self, dtype: np.dtype, shape: Union[tuple, list]):
         if not isinstance(dtype, np.dtype):
             raise TypeError(
-                "Expected `type` to be instance of `{0}`, received `{1}`".format(
-                    np.dtype, type.__class__
-                )
+                f"Expected `type` to be instance of `{np.dtype}`, received `{ type.__class__}`"
             )
         # Throw if size information exists flexible numpy data types
         if dtype.char in ["U", "S"] and not dtype.name.isalpha():
             raise MlflowException(
                 "MLflow does not support size information in flexible numpy data types. Use"
-                ' np.dtype("{0}") instead'.format(dtype.name.rstrip(string.digits))
+                ' np.dtype("{}") instead'.format(dtype.name.rstrip(string.digits))
             )
 
         if not isinstance(shape, (tuple, list)):
             raise TypeError(
-                "Expected `shape` to be instance of `{0}` or `{1}`, received `{2}`".format(
+                "Expected `shape` to be instance of `{}` or `{}`, received `{}`".format(
                     tuple, list, shape.__class__
                 )
             )
@@ -177,7 +188,7 @@ class TensorInfo:
         return cls(tensor_type, tensor_shape)
 
     def __repr__(self) -> str:
-        return "Tensor({type}, {shape})".format(type=repr(self.dtype.name), shape=repr(self.shape))
+        return f"Tensor({self.dtype.name!r}, {self.shape!r})"
 
 
 class TensorSpec:
@@ -212,6 +223,12 @@ class TensorSpec:
         """The tensor shape"""
         return self._tensorInfo.shape
 
+    @experimental
+    @property
+    def optional(self) -> bool:
+        """Whether this tensor is optional."""
+        return False
+
     def to_dict(self) -> Dict[str, Any]:
         if self.name is None:
             return {"type": "tensor", "tensor-spec": self._tensorInfo.to_dict()}
@@ -245,7 +262,7 @@ class TensorSpec:
         if self.name is None:
             return repr(self._tensorInfo)
         else:
-            return "{name}: {info}".format(name=repr(self.name), info=repr(self._tensorInfo))
+            return f"{self.name!r}: {self._tensorInfo!r}"
 
 
 class Schema:
@@ -262,32 +279,40 @@ class Schema:
     """
 
     def __init__(self, inputs: List[Union[ColSpec, TensorSpec]]):
-        if not (
-            all(map(lambda x: x.name is None, inputs))
-            or all(map(lambda x: x.name is not None, inputs))
-        ):
+        if not (all(x.name is None for x in inputs) or all(x.name is not None for x in inputs)):
             raise MlflowException(
                 "Creating Schema with a combination of named and unnamed inputs "
                 "is not allowed. Got input names {}".format([x.name for x in inputs])
             )
         if not (
-            all(map(lambda x: isinstance(x, TensorSpec), inputs))
-            or all(map(lambda x: isinstance(x, ColSpec), inputs))
+            all(isinstance(x, TensorSpec) for x in inputs)
+            or all(isinstance(x, ColSpec) for x in inputs)
         ):
             raise MlflowException(
                 "Creating Schema with a combination of {0} and {1} is not supported. "
                 "Please choose one of {0} or {1}".format(ColSpec.__class__, TensorSpec.__class__)
             )
         if (
-            all(map(lambda x: isinstance(x, TensorSpec), inputs))
+            all(isinstance(x, TensorSpec) for x in inputs)
             and len(inputs) > 1
-            and any(map(lambda x: x.name is None, inputs))
+            and any(x.name is None for x in inputs)
         ):
             raise MlflowException(
                 "Creating Schema with multiple unnamed TensorSpecs is not supported. "
                 "Please provide names for each TensorSpec."
             )
+        if all(x.name is None for x in inputs) and any(x.optional is True for x in inputs):
+            raise MlflowException(
+                "Creating Schema with unnamed optional inputs is not supported. "
+                "Please name all inputs or make all inputs required."
+            )
         self._inputs = inputs
+
+    def __len__(self):
+        return len(self._inputs)
+
+    def __iter__(self):
+        return iter(self._inputs)
 
     @property
     def inputs(self) -> List[Union[ColSpec, TensorSpec]]:
@@ -302,13 +327,28 @@ class Schema:
         """Get list of data names or range of indices if the schema has no names."""
         return [x.name or i for i, x in enumerate(self.inputs)]
 
+    def required_input_names(self) -> List[Union[str, int]]:
+        """Get list of required data names or range of indices if schema has no names."""
+        return [x.name or i for i, x in enumerate(self.inputs) if not x.optional]
+
+    @experimental
+    def optional_input_names(self) -> List[Union[str, int]]:
+        """Get list of optional data names or range of indices if schema has no names."""
+        return [x.name or i for i, x in enumerate(self.inputs) if x.optional]
+
     def has_input_names(self) -> bool:
         """Return true iff this schema declares names, false otherwise."""
         return self.inputs and self.inputs[0].name is not None
 
     def input_types(self) -> List[Union[DataType, np.dtype]]:
-        """Get types of the represented dataset."""
+        """Get types for each column in the schema."""
         return [x.type for x in self.inputs]
+
+    def input_types_dict(self) -> Dict[str, Union[DataType, np.dtype]]:
+        """Maps column names to types, iff this schema declares names."""
+        if not self.has_input_names():
+            raise MlflowException("Cannot get input types as a dict for schema without names.")
+        return {x.name: x.type for x in self.inputs}
 
     def numpy_types(self) -> List[np.dtype]:
         """Convenience shortcut to get the datatypes as numpy types."""

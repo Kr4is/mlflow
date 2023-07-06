@@ -10,6 +10,7 @@ from mlflow.entities.file_info import FileInfo
 from mlflow.store.artifact.artifact_repo import ArtifactRepository
 from mlflow.utils.file_utils import relative_path_to_artifact_path
 from mlflow.exceptions import MlflowException
+from urllib.parse import unquote
 
 
 class FTPArtifactRepository(ArtifactRepository):
@@ -24,10 +25,14 @@ class FTPArtifactRepository(ArtifactRepository):
             "username": parsed.username,
             "password": parsed.password,
         }
-        self.path = parsed.path
+        self.path = parsed.path or "/"
 
         if self.config["host"] is None:
             self.config["host"] = "localhost"
+        if self.config["password"] is None:
+            self.config["password"] = ""
+        else:
+            self.config["password"] = unquote(parsed.password)
 
         super().__init__(artifact_uri)
 
@@ -76,7 +81,7 @@ class FTPArtifactRepository(ArtifactRepository):
         dest_path = posixpath.join(self.path, artifact_path) if artifact_path else self.path
 
         local_dir = os.path.abspath(local_dir)
-        for (root, _, filenames) in os.walk(local_dir):
+        for root, _, filenames in os.walk(local_dir):
             upload_path = dest_path
             if root != local_dir:
                 rel_path = os.path.relpath(root, local_dir)

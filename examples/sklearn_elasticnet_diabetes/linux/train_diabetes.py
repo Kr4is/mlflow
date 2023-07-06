@@ -44,6 +44,7 @@ data = pd.DataFrame(d, columns=cols)
 
 # Import mlflow
 import mlflow
+from mlflow.models import infer_signature
 import mlflow.sklearn
 
 
@@ -78,10 +79,14 @@ if __name__ == "__main__":
     (rmse, mae, r2) = eval_metrics(test_y, predicted_qualities)
 
     # Print out ElasticNet model metrics
-    print("Elasticnet model (alpha=%f, l1_ratio=%f):" % (alpha, l1_ratio))
+    print("Elasticnet model (alpha={:f}, l1_ratio={:f}):".format(alpha, l1_ratio))
     print("  RMSE: %s" % rmse)
     print("  MAE: %s" % mae)
     print("  R2: %s" % r2)
+
+    # Infer model signature
+    predictions = lr.predict(train_x)
+    signature = infer_signature(train_x, predictions)
 
     # Log mlflow attributes for mlflow UI
     mlflow.log_param("alpha", alpha)
@@ -89,7 +94,7 @@ if __name__ == "__main__":
     mlflow.log_metric("rmse", rmse)
     mlflow.log_metric("r2", r2)
     mlflow.log_metric("mae", mae)
-    mlflow.sklearn.log_model(lr, "model")
+    mlflow.sklearn.log_model(lr, "model", signature=signature)
 
     # Compute paths
     eps = 5e-3  # the smaller it is the longer is the path

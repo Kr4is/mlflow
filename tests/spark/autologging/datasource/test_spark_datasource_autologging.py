@@ -1,6 +1,5 @@
 import time
 
-import pytest
 from unittest import mock
 
 from pyspark.sql import Row
@@ -11,46 +10,21 @@ import mlflow.spark
 from mlflow.utils.validation import MAX_TAG_VAL_LENGTH
 from mlflow._spark_autologging import _SPARK_TABLE_INFO_TAG_NAME
 
-from tests.tracking.test_rest_tracking import BACKEND_URIS
-from tests.tracking.test_rest_tracking import tracking_server_uri  # pylint: disable=unused-import
-from tests.tracking.test_rest_tracking import mlflow_client  # pylint: disable=unused-import
 from tests.spark.autologging.utils import _assert_spark_data_logged
-from tests.spark.autologging.utils import spark_session  # pylint: disable=unused-import
-from tests.spark.autologging.utils import format_to_file_path  # pylint: disable=unused-import
-from tests.spark.autologging.utils import data_format  # pylint: disable=unused-import
-from tests.spark.autologging.utils import file_path  # pylint: disable=unused-import
-
-
-def pytest_generate_tests(metafunc):
-    """
-    Automatically parametrize each each fixture/test that depends on `backend_store_uri` with the
-    list of backend store URIs.
-    """
-    if "backend_store_uri" in metafunc.fixturenames:
-        metafunc.parametrize("backend_store_uri", BACKEND_URIS)
-
-
-@pytest.fixture()
-def http_tracking_uri_mock():
-    mlflow.set_tracking_uri("http://some-cool-uri")
-    yield
-    mlflow.set_tracking_uri(None)
+from tests.tracking.integration_test_utils import _init_server
 
 
 def _get_expected_table_info_row(path, data_format, version=None):
     expected_path = "file:%s" % path
     if version is None:
-        return "path={path},format={format}".format(path=expected_path, format=data_format)
-    return "path={path},version={version},format={format}".format(
-        path=expected_path, version=version, format=data_format
-    )
+        return f"path={expected_path},format={data_format}"
+    return f"path={expected_path},version={version},format={data_format}"
 
 
 # Note that the following tests run one-after-the-other and operate on the SAME spark_session
 #   (it is not reset between tests)
 
 
-@pytest.mark.large
 def test_autologging_of_datasources_with_different_formats(spark_session, format_to_file_path):
     mlflow.spark.autolog()
     for data_format, file_path in format_to_file_path.items():
@@ -82,35 +56,29 @@ def test_autologging_of_datasources_with_different_formats(spark_session, format
             _assert_spark_data_logged(run=run, path=file_path, data_format=data_format)
 
 
-@pytest.mark.large
-def test_autologging_does_not_throw_on_api_failures(
-    spark_session, format_to_file_path, mlflow_client
-):
-    # pylint: disable=unused-argument
+def test_autologging_does_not_throw_on_api_failures(spark_session, format_to_file_path, tmp_path):
     mlflow.spark.autolog()
+    with _init_server(f"sqlite:///{tmp_path}/test.db", root_artifact_uri=tmp_path.as_uri()) as url:
+        mlflow.set_tracking_uri(url)
+        with mlflow.start_run():
+            with mock.patch(
+                "mlflow.utils.rest_utils.http_request", side_effect=Exception("API request failed!")
+            ):
+                data_format = list(format_to_file_path.keys())[0]
+                file_path = format_to_file_path[data_format]
+                df = (
+                    spark_session.read.format(data_format)
+                    .option("header", "true")
+                    .option("inferSchema", "true")
+                    .load(file_path)
+                )
+                df.collect()
+                df.filter("number1 > 0").collect()
+                df.limit(2).collect()
+                df.collect()
+                time.sleep(1)
 
-    def failing_req_mock(*args, **kwargs):
-        raise Exception("API request failed!")
 
-    with mlflow.start_run():
-        with mock.patch("mlflow.utils.rest_utils.http_request") as http_request_mock:
-            http_request_mock.side_effect = failing_req_mock
-            data_format = list(format_to_file_path.keys())[0]
-            file_path = format_to_file_path[data_format]
-            df = (
-                spark_session.read.format(data_format)
-                .option("header", "true")
-                .option("inferSchema", "true")
-                .load(file_path)
-            )
-            df.collect()
-            df.filter("number1 > 0").collect()
-            df.limit(2).collect()
-            df.collect()
-            time.sleep(1)
-
-
-@pytest.mark.large
 def test_autologging_dedups_multiple_reads_of_same_datasource(spark_session, format_to_file_path):
     mlflow.spark.autolog()
     data_format = list(format_to_file_path.keys())[0]
@@ -141,7 +109,6 @@ def test_autologging_dedups_multiple_reads_of_same_datasource(spark_session, for
     _assert_spark_data_logged(run=run2, path=file_path, data_format=data_format)
 
 
-@pytest.mark.large
 def test_autologging_multiple_reads_same_run(spark_session, format_to_file_path):
     mlflow.spark.autolog()
     with mlflow.start_run():
@@ -161,7 +128,6 @@ def test_autologging_multiple_reads_same_run(spark_session, format_to_file_path)
         )
 
 
-@pytest.mark.large
 def test_autologging_multiple_runs_same_data(spark_session, format_to_file_path):
     mlflow.spark.autolog()
     data_format = list(format_to_file_path.keys())[0]
@@ -182,7 +148,6 @@ def test_autologging_multiple_runs_same_data(spark_session, format_to_file_path)
             _assert_spark_data_logged(run=run, path=file_path, data_format=data_format)
 
 
-@pytest.mark.large
 def test_autologging_does_not_start_run(spark_session, format_to_file_path):
     try:
         mlflow.spark.autolog()
@@ -203,8 +168,6 @@ def test_autologging_does_not_start_run(spark_session, format_to_file_path):
         mlflow.end_run()
 
 
-@pytest.mark.large
-@pytest.mark.usefixtures("mlflow_client")
 def test_autologging_slow_api_requests(spark_session, format_to_file_path):
     import mlflow.utils.rest_utils
 
@@ -248,8 +211,7 @@ def test_autologging_slow_api_requests(spark_session, format_to_file_path):
     )
 
 
-@pytest.mark.large
-def test_autologging_truncates_datasource_tag_to_maximum_supported_value(tmpdir, spark_session):
+def test_autologging_truncates_datasource_tag_to_maximum_supported_value(tmp_path, spark_session):
     rows = [Row(100)]
     schema = StructType([StructField("number2", IntegerType())])
     rdd = spark_session.sparkContext.parallelize(rows)
@@ -257,7 +219,7 @@ def test_autologging_truncates_datasource_tag_to_maximum_supported_value(tmpdir,
 
     # Save a Spark Dataframe to multiple paths with an aggregate path length
     # exceeding the maximum length of an MLflow tag (`MAX_TAG_VAL_LENGTH`)
-    long_path_base = str(tmpdir.join("a" * 150))
+    long_path_base = str(tmp_path.joinpath("a" * 150))
     saved_df_paths = []
     for path_suffix in range(int(MAX_TAG_VAL_LENGTH / len(long_path_base)) + 5):
         long_path = long_path_base + str(path_suffix)
@@ -313,7 +275,6 @@ def test_autologging_truncates_datasource_tag_to_maximum_supported_value(tmpdir,
         assert_tag_value_meets_requirements(run.info.run_id)
 
 
-@pytest.mark.large
 def test_enabling_autologging_does_not_throw_when_spark_hasnt_been_started(spark_session):
     spark_session.stop()
     mlflow.spark.autolog()

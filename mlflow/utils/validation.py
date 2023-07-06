@@ -5,30 +5,49 @@ import numbers
 import posixpath
 import re
 
+from typing import List
+
 from mlflow.exceptions import MlflowException
 from mlflow.protos.databricks_pb2 import INVALID_PARAMETER_VALUE
 from mlflow.store.db.db_types import DATABASE_ENGINES
 from mlflow.utils.string_utils import is_string_type
+from mlflow.entities import DatasetInput, Dataset, InputTag
 
+# Regex for valid param and metric names: may only contain slashes, alphanumerics,
+# underscores, periods, dashes, and spaces.
 _VALID_PARAM_AND_METRIC_NAMES = re.compile(r"^[/\w.\- ]*$")
 
 # Regex for valid run IDs: must be an alphanumeric string of length 1 to 256.
 _RUN_ID_REGEX = re.compile(r"^[a-zA-Z0-9][\w\-]{0,255}$")
 
+# Regex: starting with an alphanumeric, optionally followed by up to 63 characters
+# including alphanumerics, underscores, or dashes.
 _EXPERIMENT_ID_REGEX = re.compile(r"^[a-zA-Z0-9][\w\-]{0,63}$")
+
+# Regex for valid registered model alias names: may only contain alphanumerics,
+# underscores, and dashes.
+_REGISTERED_MODEL_ALIAS_REGEX = re.compile(r"^[\w\-]*$")
+
+# Regex for valid registered model alias to prevent conflict with version aliases.
+_REGISTERED_MODEL_ALIAS_VERSION_REGEX = re.compile(r"^[vV]\d+$")
 
 _BAD_CHARACTERS_MESSAGE = (
     "Names may only contain alphanumerics, underscores (_), dashes (-), periods (.),"
     " spaces ( ), and slashes (/)."
 )
 
+_BAD_ALIAS_CHARACTERS_MESSAGE = (
+    "Names may only contain alphanumerics, underscores (_), and dashes (-)."
+)
+
 _MISSING_KEY_NAME_MESSAGE = "A key name must be provided."
 
 MAX_PARAMS_TAGS_PER_BATCH = 100
 MAX_METRICS_PER_BATCH = 1000
+MAX_DATASETS_PER_BATCH = 1000
 MAX_ENTITIES_PER_BATCH = 1000
 MAX_BATCH_LOG_REQUEST_SIZE = int(1e6)
-MAX_PARAM_VAL_LENGTH = 250
+MAX_PARAM_VAL_LENGTH = 500
 MAX_TAG_VAL_LENGTH = 5000
 MAX_EXPERIMENT_TAG_KEY_LENGTH = 250
 MAX_EXPERIMENT_TAG_VAL_LENGTH = 5000
@@ -36,6 +55,14 @@ MAX_ENTITY_KEY_LENGTH = 250
 MAX_MODEL_REGISTRY_TAG_KEY_LENGTH = 250
 MAX_MODEL_REGISTRY_TAG_VALUE_LENGTH = 5000
 MAX_EXPERIMENTS_LISTED_PER_PAGE = 50000
+MAX_DATASET_NAME_SIZE = 500
+MAX_DATASET_DIGEST_SIZE = 36
+MAX_DATASET_SCHEMA_SIZE = 65535  # 64KB -1 (the db limit for TEXT column)
+MAX_DATASET_SOURCE_SIZE = 65535  # 64KB -1 (the db limit for TEXT column)
+MAX_DATASET_PROFILE_SIZE = 16777215  # 16MB -1 (the db limit for MEDIUMTEXT column)
+MAX_INPUT_TAG_KEY_SIZE = 255
+MAX_INPUT_TAG_VALUE_SIZE = 500
+MAX_REGISTERED_MODEL_ALIAS_LENGTH = 255
 
 _UNSUPPORTED_DB_TYPE_MSG = "Supported database engines are {%s}" % ", ".join(DATABASE_ENGINES)
 
@@ -89,12 +116,12 @@ def _validate_metric_name(name):
         )
     if not _VALID_PARAM_AND_METRIC_NAMES.match(name):
         raise MlflowException(
-            "Invalid metric name: '%s'. %s" % (name, _BAD_CHARACTERS_MESSAGE),
+            f"Invalid metric name: '{name}'. {_BAD_CHARACTERS_MESSAGE}",
             INVALID_PARAMETER_VALUE,
         )
     if path_not_unique(name):
         raise MlflowException(
-            "Invalid metric name: '%s'. %s" % (name, bad_path_message(name)),
+            f"Invalid metric name: '{name}'. {bad_path_message(name)}",
             INVALID_PARAMETER_VALUE,
         )
 
@@ -110,30 +137,30 @@ def _is_numeric(value):
 
 def _validate_metric(key, value, timestamp, step):
     """
-    Check that a param with the specified key, value, timestamp is valid and raise an exception if
-    it isn't.
+    Check that a metric with the specified key, value, timestamp, and step is valid and raise an
+    exception if it isn't.
     """
     _validate_metric_name(key)
     # value must be a Number
     # since bool is an instance of Number check for bool additionally
     if not _is_numeric(value):
         raise MlflowException(
-            "Got invalid value %s for metric '%s' (timestamp=%s). Please specify value as a valid "
-            "double (64-bit floating point)" % (value, key, timestamp),
+            f"Got invalid value {value} for metric '{key}' (timestamp={timestamp}). "
+            "Please specify value as a valid double (64-bit floating point)",
             INVALID_PARAMETER_VALUE,
         )
 
     if not isinstance(timestamp, numbers.Number) or timestamp < 0:
         raise MlflowException(
-            "Got invalid timestamp %s for metric '%s' (value=%s). Timestamp must be a nonnegative "
-            "long (64-bit integer) " % (timestamp, key, value),
+            f"Got invalid timestamp {timestamp} for metric '{key}' (value={value}). "
+            "Timestamp must be a nonnegative long (64-bit integer) ",
             INVALID_PARAMETER_VALUE,
         )
 
     if not isinstance(step, numbers.Number):
         raise MlflowException(
-            "Got invalid step %s for metric '%s' (value=%s). Step must be a valid long "
-            "(64-bit integer)." % (step, key, value),
+            f"Got invalid step {step} for metric '{key}' (value={value}). "
+            "Step must be a valid long (64-bit integer).",
             INVALID_PARAMETER_VALUE,
         )
 
@@ -180,32 +207,9 @@ def _validate_model_version_tag(key, value):
     Check that a tag with the specified key & value is valid and raise an exception if it isn't.
     """
     _validate_tag_name(key)
+    _validate_tag_value(value)
     _validate_length_limit("Model version key", MAX_MODEL_REGISTRY_TAG_KEY_LENGTH, key)
     _validate_length_limit("Model version value", MAX_MODEL_REGISTRY_TAG_VALUE_LENGTH, value)
-
-
-def _validate_list_experiments_max_results(max_results):
-    """
-    Check that `max_results` is within an acceptable range and raise an exception if it isn't.
-    """
-    if max_results is None:
-        return
-
-    if max_results < 1:
-        raise MlflowException(
-            "Invalid value for request parameter max_results. "
-            "It must be at least 1, but got value {}".format(max_results),
-            INVALID_PARAMETER_VALUE,
-        )
-
-    if max_results > MAX_EXPERIMENTS_LISTED_PER_PAGE:
-        raise MlflowException(
-            "Invalid value for request parameter max_results. "
-            "It must be at most {}, but got value {}".format(
-                MAX_EXPERIMENTS_LISTED_PER_PAGE, max_results
-            ),
-            INVALID_PARAMETER_VALUE,
-        )
 
 
 def _validate_param_keys_unique(params):
@@ -235,12 +239,12 @@ def _validate_param_name(name):
         )
     if not _VALID_PARAM_AND_METRIC_NAMES.match(name):
         raise MlflowException(
-            "Invalid parameter name: '%s'. %s" % (name, _BAD_CHARACTERS_MESSAGE),
+            f"Invalid parameter name: '{name}'. {_BAD_CHARACTERS_MESSAGE}",
             INVALID_PARAMETER_VALUE,
         )
     if path_not_unique(name):
         raise MlflowException(
-            "Invalid parameter name: '%s'. %s" % (name, bad_path_message(name)),
+            f"Invalid parameter name: '{name}'. {bad_path_message(name)}",
             INVALID_PARAMETER_VALUE,
         )
 
@@ -255,19 +259,21 @@ def _validate_tag_name(name):
         )
     if not _VALID_PARAM_AND_METRIC_NAMES.match(name):
         raise MlflowException(
-            "Invalid tag name: '%s'. %s" % (name, _BAD_CHARACTERS_MESSAGE), INVALID_PARAMETER_VALUE
+            f"Invalid tag name: '{name}'. {_BAD_CHARACTERS_MESSAGE}",
+            INVALID_PARAMETER_VALUE,
         )
     if path_not_unique(name):
         raise MlflowException(
-            "Invalid tag name: '%s'. %s" % (name, bad_path_message(name)), INVALID_PARAMETER_VALUE
+            f"Invalid tag name: '{name}'. {bad_path_message(name)}",
+            INVALID_PARAMETER_VALUE,
         )
 
 
 def _validate_length_limit(entity_name, limit, value):
-    if len(value) > limit:
+    if value is not None and len(value) > limit:
         raise MlflowException(
-            "%s '%s' had length %s, which exceeded length limit of %s"
-            % (entity_name, value[:250], len(value), limit),
+            f"{entity_name} '{value[:250]}' had length {len(value)}, "
+            f"which exceeded length limit of {limit}",
             error_code=INVALID_PARAMETER_VALUE,
         )
 
@@ -289,10 +295,10 @@ def _validate_experiment_id(exp_id):
 def _validate_batch_limit(entity_name, limit, length):
     if length > limit:
         error_msg = (
-            "A batch logging request can contain at most {limit} {name}. "
-            "Got {count} {name}. Please split up {name} across multiple requests and try "
-            "again."
-        ).format(name=entity_name, count=length, limit=limit)
+            f"A batch logging request can contain at most {limit} {entity_name}. "
+            f"Got {length} {entity_name}. Please split up {entity_name} across multiple"
+            " requests and try again."
+        )
         raise MlflowException(error_msg, error_code=INVALID_PARAMETER_VALUE)
 
 
@@ -345,6 +351,19 @@ def _validate_experiment_name(experiment_name):
         )
 
 
+def _validate_experiment_id_type(experiment_id):
+    """
+    Check that a user-provided experiment_id is either a string, int, or None and raise an
+    exception if it isn't.
+    """
+    if experiment_id is not None and not isinstance(experiment_id, (str, int)):
+        raise MlflowException(
+            f"Invalid experiment id: {experiment_id} of type {type(experiment_id)}. "
+            "Must be one of str, int, or None.",
+            error_code=INVALID_PARAMETER_VALUE,
+        )
+
+
 def _validate_model_name(model_name):
     if model_name is None or model_name == "":
         raise MlflowException("Registered model name cannot be empty.", INVALID_PARAMETER_VALUE)
@@ -355,8 +374,31 @@ def _validate_model_version(model_version):
         model_version = int(model_version)
     except ValueError:
         raise MlflowException(
-            "Model version must be an integer, got '{}'".format(model_version),
+            f"Model version must be an integer, got '{model_version}'",
             error_code=INVALID_PARAMETER_VALUE,
+        )
+
+
+def _validate_model_alias_name(model_alias_name):
+    if model_alias_name is None or model_alias_name == "":
+        raise MlflowException(
+            "Registered model alias name cannot be empty.", INVALID_PARAMETER_VALUE
+        )
+    if not _REGISTERED_MODEL_ALIAS_REGEX.match(model_alias_name):
+        raise MlflowException(
+            f"Invalid alias name: '{model_alias_name}'. {_BAD_ALIAS_CHARACTERS_MESSAGE}",
+            INVALID_PARAMETER_VALUE,
+        )
+    _validate_length_limit(
+        "Registered model alias name", MAX_REGISTERED_MODEL_ALIAS_LENGTH, model_alias_name
+    )
+    if model_alias_name.lower() == "latest":
+        raise MlflowException(
+            "'latest' alias name (case insensitive) is reserved.", INVALID_PARAMETER_VALUE
+        )
+    if _REGISTERED_MODEL_ALIAS_VERSION_REGEX.match(model_alias_name):
+        raise MlflowException(
+            f"Version alias name '{model_alias_name}' is reserved.", INVALID_PARAMETER_VALUE
         )
 
 
@@ -371,5 +413,91 @@ def _validate_experiment_artifact_location(artifact_location):
 def _validate_db_type_string(db_type):
     """validates db_type parsed from DB URI is supported"""
     if db_type not in DATABASE_ENGINES:
-        error_msg = "Invalid database engine: '%s'. '%s'" % (db_type, _UNSUPPORTED_DB_TYPE_MSG)
+        error_msg = f"Invalid database engine: '{db_type}'. '{_UNSUPPORTED_DB_TYPE_MSG}'"
         raise MlflowException(error_msg, INVALID_PARAMETER_VALUE)
+
+
+def _validate_model_version_or_stage_exists(version, stage):
+    if version and stage:
+        raise MlflowException("version and stage cannot be set together", INVALID_PARAMETER_VALUE)
+
+    if not (version or stage):
+        raise MlflowException("version or stage must be set", INVALID_PARAMETER_VALUE)
+
+
+def _validate_tag_value(value):
+    if value is None:
+        raise MlflowException("Tag value cannot be None", INVALID_PARAMETER_VALUE)
+
+
+def _validate_dataset_inputs(dataset_inputs: List[DatasetInput]):
+    for dataset_input in dataset_inputs:
+        _validate_dataset(dataset_input.dataset)
+        _validate_input_tags(dataset_input.tags)
+
+
+def _validate_dataset(dataset: Dataset):
+    if dataset is None:
+        raise MlflowException("Dataset cannot be None", INVALID_PARAMETER_VALUE)
+    if dataset.name is None:
+        raise MlflowException("Dataset name cannot be None", INVALID_PARAMETER_VALUE)
+    if dataset.digest is None:
+        raise MlflowException("Dataset digest cannot be None", INVALID_PARAMETER_VALUE)
+    if dataset.source_type is None:
+        raise MlflowException("Dataset source_type cannot be None", INVALID_PARAMETER_VALUE)
+    if dataset.source is None:
+        raise MlflowException("Dataset source cannot be None", INVALID_PARAMETER_VALUE)
+    if len(dataset.name) > MAX_DATASET_NAME_SIZE:
+        raise MlflowException(
+            f"Dataset name exceeds the maximum length of {MAX_DATASET_NAME_SIZE}",
+            INVALID_PARAMETER_VALUE,
+        )
+    if len(dataset.digest) > MAX_DATASET_DIGEST_SIZE:
+        raise MlflowException(
+            f"Dataset digest exceeds the maximum length of {MAX_DATASET_DIGEST_SIZE}",
+            INVALID_PARAMETER_VALUE,
+        )
+    if len(dataset.source) > MAX_DATASET_SOURCE_SIZE:
+        raise MlflowException(
+            f"Dataset source exceeds the maximum length of {MAX_DATASET_SOURCE_SIZE}",
+            INVALID_PARAMETER_VALUE,
+        )
+    if dataset.schema is not None and len(dataset.schema) > MAX_DATASET_SCHEMA_SIZE:
+        raise MlflowException(
+            f"Dataset schema exceeds the maximum length of {MAX_DATASET_SCHEMA_SIZE}",
+            INVALID_PARAMETER_VALUE,
+        )
+    if dataset.profile is not None and len(dataset.profile) > MAX_DATASET_PROFILE_SIZE:
+        raise MlflowException(
+            f"Dataset profile exceeds the maximum length of {MAX_DATASET_PROFILE_SIZE}",
+            INVALID_PARAMETER_VALUE,
+        )
+
+
+def _validate_input_tags(input_tags: List[InputTag]):
+    for input_tag in input_tags:
+        _validate_input_tag(input_tag)
+
+
+def _validate_input_tag(input_tag: InputTag):
+    if input_tag is None:
+        raise MlflowException("InputTag cannot be None", INVALID_PARAMETER_VALUE)
+    if input_tag.key is None:
+        raise MlflowException("InputTag key cannot be None", INVALID_PARAMETER_VALUE)
+    if input_tag.value is None:
+        raise MlflowException("InputTag value cannot be None", INVALID_PARAMETER_VALUE)
+    if len(input_tag.key) > MAX_INPUT_TAG_KEY_SIZE:
+        raise MlflowException(
+            f"InputTag key exceeds the maximum length of {MAX_INPUT_TAG_KEY_SIZE}",
+            INVALID_PARAMETER_VALUE,
+        )
+    if len(input_tag.value) > MAX_INPUT_TAG_VALUE_SIZE:
+        raise MlflowException(
+            f"InputTag value exceeds the maximum length of {MAX_INPUT_TAG_VALUE_SIZE}",
+            INVALID_PARAMETER_VALUE,
+        )
+
+
+def _validate_username(username):
+    if username is None or username == "":
+        raise MlflowException("Username cannot be empty.", INVALID_PARAMETER_VALUE)

@@ -1,32 +1,28 @@
 import os
 from functools import partial
 import logging
+from pathlib import Path
+from typing import Union
+from contextlib import contextmanager
 
+from mlflow.environment_variables import (
+    MLFLOW_TRACKING_AWS_SIGV4,
+    MLFLOW_TRACKING_URI,
+    MLFLOW_TRACKING_TOKEN,
+    MLFLOW_TRACKING_INSECURE_TLS,
+    MLFLOW_TRACKING_CLIENT_CERT_PATH,
+    MLFLOW_TRACKING_SERVER_CERT_PATH,
+)
 from mlflow.store.tracking import DEFAULT_LOCAL_FILE_AND_ARTIFACT_PATH
 from mlflow.store.db.db_types import DATABASE_ENGINES
 from mlflow.store.tracking.file_store import FileStore
-from mlflow.store.tracking.rest_store import RestStore, DatabricksRestStore
+from mlflow.store.tracking.rest_store import RestStore
 from mlflow.tracking._tracking_service.registry import TrackingStoreRegistry
-from mlflow.utils import env, rest_utils
+from mlflow.utils import rest_utils
 from mlflow.utils.file_utils import path_to_local_file_uri
 from mlflow.utils.databricks_utils import get_databricks_host_creds
-
-_TRACKING_URI_ENV_VAR = "MLFLOW_TRACKING_URI"
-
-# Extra environment variables which take precedence for setting the basic/bearer
-# auth on http requests.
-_TRACKING_USERNAME_ENV_VAR = "MLFLOW_TRACKING_USERNAME"
-_TRACKING_PASSWORD_ENV_VAR = "MLFLOW_TRACKING_PASSWORD"
-_TRACKING_TOKEN_ENV_VAR = "MLFLOW_TRACKING_TOKEN"
-
-# sets verify param of 'requests.request' function
-# see https://requests.readthedocs.io/en/master/api/
-_TRACKING_INSECURE_TLS_ENV_VAR = "MLFLOW_TRACKING_INSECURE_TLS"
-_TRACKING_SERVER_CERT_PATH_ENV_VAR = "MLFLOW_TRACKING_SERVER_CERT_PATH"
-
-# sets cert param of 'requests.request' function
-# see https://requests.readthedocs.io/en/master/api/
-_TRACKING_CLIENT_CERT_PATH_ENV_VAR = "MLFLOW_TRACKING_CLIENT_CERT_PATH"
+from mlflow.utils.uri import _DATABRICKS_UNITY_CATALOG_SCHEME
+from mlflow.utils.credentials import read_mlflow_creds
 
 _logger = logging.getLogger(__name__)
 _tracking_uri = None
@@ -34,12 +30,12 @@ _tracking_uri = None
 
 def is_tracking_uri_set():
     """Returns True if the tracking URI has been set, False otherwise."""
-    if _tracking_uri or env.get_env(_TRACKING_URI_ENV_VAR):
+    if _tracking_uri or MLFLOW_TRACKING_URI.get():
         return True
     return False
 
 
-def set_tracking_uri(uri: str) -> None:
+def set_tracking_uri(uri: Union[str, Path]) -> None:
     """
     Set the tracking server URI. This does not affect the
     currently active run (if one exists), but takes effect for successive runs.
@@ -53,8 +49,9 @@ def set_tracking_uri(uri: str) -> None:
                   Databricks CLI
                   `profile <https://github.com/databricks/databricks-cli#installation>`_,
                   "databricks://<profileName>".
+                - A :py:class:`pathlib.Path` instance
 
-    .. code-block:: python
+    .. test-code-block:: python
         :caption: Example
 
         import mlflow
@@ -68,8 +65,30 @@ def set_tracking_uri(uri: str) -> None:
 
         Current tracking uri: file:///tmp/my_tracking
     """
+    if isinstance(uri, Path):
+        # On Windows with Python3.8 (https://bugs.python.org/issue38671)
+        # .resolve() doesn't return the absolute path if the directory doesn't exist
+        # so we're calling .absolute() first to get the absolute path on Windows,
+        # then .resolve() to clean the path
+        uri = uri.absolute().resolve().as_uri()
     global _tracking_uri
     _tracking_uri = uri
+
+
+@contextmanager
+def _use_tracking_uri(uri: str) -> None:
+    """
+    Temporarily use the specified tracking URI.
+
+    :param uri: The tracking URI to use.
+    """
+    global _tracking_uri
+    old_tracking_uri = _tracking_uri
+    try:
+        _tracking_uri = uri
+        yield
+    finally:
+        _tracking_uri = old_tracking_uri
 
 
 def _resolve_tracking_uri(tracking_uri=None):
@@ -100,8 +119,8 @@ def get_tracking_uri() -> str:
     global _tracking_uri
     if _tracking_uri is not None:
         return _tracking_uri
-    elif env.get_env(_TRACKING_URI_ENV_VAR) is not None:
-        return env.get_env(_TRACKING_URI_ENV_VAR)
+    elif uri := MLFLOW_TRACKING_URI.get():
+        return uri
     else:
         return path_to_local_file_uri(os.path.abspath(DEFAULT_LOCAL_FILE_AND_ARTIFACT_PATH))
 
@@ -119,14 +138,16 @@ def _get_sqlalchemy_store(store_uri, artifact_uri):
 
 
 def _get_default_host_creds(store_uri):
+    creds = read_mlflow_creds()
     return rest_utils.MlflowHostCreds(
         host=store_uri,
-        username=os.environ.get(_TRACKING_USERNAME_ENV_VAR),
-        password=os.environ.get(_TRACKING_PASSWORD_ENV_VAR),
-        token=os.environ.get(_TRACKING_TOKEN_ENV_VAR),
-        ignore_tls_verification=os.environ.get(_TRACKING_INSECURE_TLS_ENV_VAR) == "true",
-        client_cert_path=os.environ.get(_TRACKING_CLIENT_CERT_PATH_ENV_VAR),
-        server_cert_path=os.environ.get(_TRACKING_SERVER_CERT_PATH_ENV_VAR),
+        username=creds.username,
+        password=creds.password,
+        token=MLFLOW_TRACKING_TOKEN.get(),
+        aws_sigv4=MLFLOW_TRACKING_AWS_SIGV4.get(),
+        ignore_tls_verification=MLFLOW_TRACKING_INSECURE_TLS.get(),
+        client_cert_path=MLFLOW_TRACKING_CLIENT_CERT_PATH.get(),
+        server_cert_path=MLFLOW_TRACKING_SERVER_CERT_PATH.get(),
     )
 
 
@@ -135,21 +156,58 @@ def _get_rest_store(store_uri, **_):
 
 
 def _get_databricks_rest_store(store_uri, **_):
-    return DatabricksRestStore(partial(get_databricks_host_creds, store_uri))
+    return RestStore(partial(get_databricks_host_creds, store_uri))
+
+
+def _get_databricks_uc_rest_store(store_uri, **_):
+    from mlflow.exceptions import MlflowException
+    from mlflow.version import VERSION
+
+    global _tracking_store_registry
+    supported_schemes = [
+        scheme
+        for scheme in _tracking_store_registry._registry
+        if scheme != _DATABRICKS_UNITY_CATALOG_SCHEME
+    ]
+    raise MlflowException(
+        f"Detected Unity Catalog tracking URI '{store_uri}'. "
+        "Setting the tracking URI to a Unity Catalog backend is not supported in the current "
+        f"version of the MLflow client ({VERSION}). "
+        "Please specify a different tracking URI via mlflow.set_tracking_uri, with "
+        "one of the supported schemes: "
+        f"{supported_schemes}. If you're trying to access models in the Unity "
+        "Catalog, please upgrade to the latest version of the MLflow Python "
+        "client, then specify a Unity Catalog model registry URI via "
+        f"mlflow.set_registry_uri('{_DATABRICKS_UNITY_CATALOG_SCHEME}') or "
+        f"mlflow.set_registry_uri('{_DATABRICKS_UNITY_CATALOG_SCHEME}://profile_name'), where "
+        "'profile_name' is the name of the Databricks CLI profile to use for "
+        "authentication. Be sure to leave the tracking URI configured to use "
+        "one of the supported schemes listed above."
+    )
 
 
 _tracking_store_registry = TrackingStoreRegistry()
-_tracking_store_registry.register("", _get_file_store)
-_tracking_store_registry.register("file", _get_file_store)
-_tracking_store_registry.register("databricks", _get_databricks_rest_store)
 
-for scheme in ["http", "https"]:
-    _tracking_store_registry.register(scheme, _get_rest_store)
 
-for scheme in DATABASE_ENGINES:
-    _tracking_store_registry.register(scheme, _get_sqlalchemy_store)
+def _register_tracking_stores():
+    global _tracking_store_registry
+    _tracking_store_registry.register("", _get_file_store)
+    _tracking_store_registry.register("file", _get_file_store)
+    _tracking_store_registry.register("databricks", _get_databricks_rest_store)
+    _tracking_store_registry.register(
+        _DATABRICKS_UNITY_CATALOG_SCHEME, _get_databricks_uc_rest_store
+    )
 
-_tracking_store_registry.register_entrypoints()
+    for scheme in ["http", "https"]:
+        _tracking_store_registry.register(scheme, _get_rest_store)
+
+    for scheme in DATABASE_ENGINES:
+        _tracking_store_registry.register(scheme, _get_sqlalchemy_store)
+
+    _tracking_store_registry.register_entrypoints()
+
+
+_register_tracking_stores()
 
 
 def _get_store(store_uri=None, artifact_uri=None):

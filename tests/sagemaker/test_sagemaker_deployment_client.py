@@ -4,13 +4,16 @@ import time
 from collections import namedtuple
 from io import BytesIO
 from unittest import mock
+from functools import wraps
 
+import json
 import boto3
 import botocore
 import numpy as np
 import pandas as pd
 from click.testing import CliRunner
 from sklearn.linear_model import LogisticRegression
+from moto.core import DEFAULT_ACCOUNT_ID
 
 import mlflow
 import mlflow.pyfunc
@@ -60,8 +63,18 @@ def sagemaker_deployment_client():
     )
 
 
-def create_sagemaker_deployment_through_cli(app_name, model_uri, region_name):
-    result = CliRunner(env={"LC_ALL": "en_US.UTF-8", "LANG": "en_US.UTF-8"}).invoke(
+def create_sagemaker_deployment_through_cli(
+    app_name, model_uri, region_name, env=None, config=None
+):
+    if env is None:
+        env = {"LC_ALL": "en_US.UTF-8", "LANG": "en_US.UTF-8"}
+    if config is not None:
+        _config = []
+        for c in config:
+            _config += ["-C", c]
+    else:
+        _config = []
+    result = CliRunner(env=env).invoke(
         cli_commands,
         [
             "create",
@@ -71,17 +84,17 @@ def create_sagemaker_deployment_through_cli(app_name, model_uri, region_name):
             app_name,
             "--model-uri",
             model_uri,
-        ],
+        ]
+        + _config,
     )
     assert result.exit_code == 0
 
 
 def get_sagemaker_backend(region_name):
-    return mock_sagemaker.backends[region_name]
+    return mock_sagemaker.backends[DEFAULT_ACCOUNT_ID][region_name]
 
 
 def mock_sagemaker_aws_services(fn):
-    from functools import wraps
     from moto import mock_s3, mock_ecr, mock_sts, mock_iam
 
     @mock_ecr
@@ -111,7 +124,7 @@ def mock_sagemaker_aws_services(fn):
         iam_client = boto3.client("iam", region_name="us-west-2")
         iam_client.create_role(RoleName="moto", AssumeRolePolicyDocument=role_policy)
 
-        # Create IAM role to be asssumed (could be in another AWS account)
+        # Create IAM role to be assumed (could be in another AWS account)
         iam_client.create_role(RoleName="assumed_role", AssumeRolePolicyDocument=role_policy)
         return fn(*args, **kwargs)
 
@@ -187,8 +200,6 @@ def test__apply_custom_config_converts_from_string_to_bool_for_bool_fields(
 def test__apply_custom_config_converts_from_string_to_dict_for_dict_fields(
     sagemaker_deployment_client,
 ):
-    import json
-
     vpc_config = {
         "SecurityGroupIds": [
             "sg-123456abc",
@@ -197,12 +208,24 @@ def test__apply_custom_config_converts_from_string_to_dict_for_dict_fields(
             "subnet-123456abc",
         ],
     }
-    config = {"vpc_config": None}
-    custom_config = {"vpc_config": json.dumps(vpc_config)}
+    env_config = {
+        "GUNICORN_CMD_ARGS": "--timeout=60",
+    }
+    tags_config = {
+        "tag1": "value1",
+    }
+    config = {"vpc_config": None, "env": None, "tags": None}
+    custom_config = {
+        "vpc_config": json.dumps(vpc_config),
+        "env": json.dumps(env_config),
+        "tags": json.dumps(tags_config),
+    }
 
     sagemaker_deployment_client._apply_custom_config(config, custom_config)
 
     assert config["vpc_config"] == vpc_config
+    assert config["env"] == env_config
+    assert config["tags"] == tags_config
 
 
 def test__apply_custom_config_does_not_change_type_of_string_fields(sagemaker_deployment_client):
@@ -214,10 +237,8 @@ def test__apply_custom_config_does_not_change_type_of_string_fields(sagemaker_de
     assert config["region_name"] == "us-east-3"
 
 
-@pytest.mark.large
 @mock_sagemaker_aws_services
 def test_create_deployment_with_non_existent_assume_role_arn_raises_exception(pretrained_model):
-
     plugin = mfs.SageMakerDeploymentClient(
         "sagemaker:/us-west-2/arn:aws:iam::123456789012:role/non-existent-role-arn"
     )
@@ -232,7 +253,6 @@ def test_create_deployment_with_non_existent_assume_role_arn_raises_exception(pr
         )
 
 
-@pytest.mark.large
 @mock_sagemaker_aws_services
 def test_create_deployment_with_assume_role_arn(
     pretrained_model, sagemaker_client, sagemaker_deployment_client
@@ -247,7 +267,103 @@ def test_create_deployment_with_assume_role_arn(
     ]
 
 
-@pytest.mark.large
+@mock_sagemaker_aws_services
+def test_create_deployment_with_async_config(
+    pretrained_model, sagemaker_client, sagemaker_deployment_client
+):
+    app_name = "deploy_with_async_config"
+    expected_async_inference_config = {
+        "ClientConfig": {"MaxConcurrentInvocationsPerInstance": 4},
+        "OutputConfig": {"S3OutputPath": "s3://bucket_name/", "NotificationConfig": {}},
+    }
+    sagemaker_deployment_client.create_deployment(
+        name=app_name,
+        model_uri=pretrained_model.model_uri,
+        config={"async_inference_config": expected_async_inference_config},
+    )
+    configs = sagemaker_client.list_endpoint_configs()
+    target_config = None
+    for config in configs["EndpointConfigs"]:
+        if app_name in config["EndpointConfigName"]:
+            target_config = config
+    if target_config is None:
+        raise Exception("Endpoint config not found")
+    endpoint_config = sagemaker_client.describe_endpoint_config(
+        EndpointConfigName=target_config["EndpointConfigName"]
+    )
+    assert "AsyncInferenceConfig" in endpoint_config
+    assert endpoint_config["AsyncInferenceConfig"] == expected_async_inference_config
+
+
+@mock_sagemaker_aws_services
+def test_create_deployment_without_async_config(
+    pretrained_model, sagemaker_client, sagemaker_deployment_client
+):
+    app_name = "deploy_without_endpoint_config"
+    sagemaker_deployment_client.create_deployment(
+        name=app_name,
+        model_uri=pretrained_model.model_uri,
+    )
+    configs = sagemaker_client.list_endpoint_configs()
+    target_config = None
+    for config in configs["EndpointConfigs"]:
+        if app_name in config["EndpointConfigName"]:
+            target_config = config
+    if target_config is None:
+        raise Exception("Endpoint config not found")
+    assert "AsyncInferenceConfig" not in target_config
+
+
+@mock_sagemaker_aws_services
+def test_update_deployment_with_async_config_when_endpoint_exists(
+    pretrained_model, sagemaker_client, sagemaker_deployment_client
+):
+    app_name = "update_deploy_with_async_config"
+    expected_async_inference_config = {
+        "ClientConfig": {"MaxConcurrentInvocationsPerInstance": 4},
+        "OutputConfig": {"S3OutputPath": "s3://bucket_name/", "NotificationConfig": {}},
+    }
+    sagemaker_deployment_client.create_deployment(
+        name=app_name, model_uri=pretrained_model.model_uri
+    )
+    sagemaker_deployment_client.update_deployment(
+        name=app_name,
+        model_uri=pretrained_model.model_uri,
+        config={"async_inference_config": expected_async_inference_config},
+    )
+    configs = sagemaker_client.list_endpoint_configs()
+    target_config = None
+    for config in configs["EndpointConfigs"]:
+        if app_name in config["EndpointConfigName"]:
+            target_config = config
+    if target_config is None:
+        raise Exception("Endpoint config not found")
+    endpoint_config = sagemaker_client.describe_endpoint_config(
+        EndpointConfigName=target_config["EndpointConfigName"]
+    )
+    assert "AsyncInferenceConfig" in endpoint_config
+    assert endpoint_config["AsyncInferenceConfig"] == expected_async_inference_config
+
+
+@mock_sagemaker_aws_services
+def test_update_deployment_without_async_config(
+    pretrained_model, sagemaker_client, sagemaker_deployment_client
+):
+    app_name = "deploy_without_async_config"
+    sagemaker_deployment_client.update_deployment(
+        name=app_name,
+        model_uri=pretrained_model.model_uri,
+    )
+    configs = sagemaker_client.list_endpoint_configs()
+    target_config = None
+    for config in configs["EndpointConfigs"]:
+        if app_name in config["EndpointConfigName"]:
+            target_config = config
+    if target_config is None:
+        raise Exception("Endpoint config not found")
+    assert "AsyncInferenceConfig" not in target_config
+
+
 def test_create_deployment_with_unsupported_flavor_raises_exception(
     pretrained_model, sagemaker_deployment_client
 ):
@@ -261,7 +377,6 @@ def test_create_deployment_with_unsupported_flavor_raises_exception(
     assert exc.value.error_code == ErrorCode.Name(INVALID_PARAMETER_VALUE)
 
 
-@pytest.mark.large
 def test_create_deployment_with_missing_flavor_raises_exception(
     pretrained_model, sagemaker_deployment_client
 ):
@@ -275,7 +390,6 @@ def test_create_deployment_with_missing_flavor_raises_exception(
     assert exc.value.error_code == ErrorCode.Name(RESOURCE_DOES_NOT_EXIST)
 
 
-@pytest.mark.large
 def test_create_deployment_of_model_with_no_supported_flavors_raises_exception(
     pretrained_model, sagemaker_deployment_client
 ):
@@ -294,7 +408,6 @@ def test_create_deployment_of_model_with_no_supported_flavors_raises_exception(
     assert exc.value.error_code == ErrorCode.Name(RESOURCE_DOES_NOT_EXIST)
 
 
-@pytest.mark.large
 def test_attempting_to_deploy_in_asynchronous_mode_without_archiving_throws_exception(
     pretrained_model, sagemaker_deployment_client
 ):
@@ -302,23 +415,84 @@ def test_attempting_to_deploy_in_asynchronous_mode_without_archiving_throws_exce
         sagemaker_deployment_client.create_deployment(
             name="test-app",
             model_uri=pretrained_model.model_uri,
-            config=dict(archive=False, synchronous=False),
+            config={"archive": False, "synchronous": False},
         )
 
     assert "Resources must be archived" in exc.value.message
     assert exc.value.error_code == ErrorCode.Name(INVALID_PARAMETER_VALUE)
 
 
-@pytest.mark.large
 @mock_sagemaker_aws_services
-def test_create_deployment_create_sagemaker_and_s3_resources_with_expected_names_and_env_from_local(
-    pretrained_model, sagemaker_client, sagemaker_deployment_client
+def test_create_deployment_create_sagemaker_and_s3_resources_with_expected_tags_from_local(
+    pretrained_model, sagemaker_client, sagemaker_deployment_client, monkeypatch
 ):
+    expected_tags = [{"Key": "key1", "Value": "value1"}, {"Key": "key2", "Value": "value2"}]
+
     name = "test-app"
+    monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
+    monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
+    monkeypatch.delenv("AWS_SESSION_TOKEN", raising=False)
+    monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
     sagemaker_deployment_client.create_deployment(
         name=name,
         model_uri=pretrained_model.model_uri,
+        config={
+            "tags": {"key1": "value1", "key2": "value2"},
+        },
     )
+
+    endpoint_description = sagemaker_client.describe_endpoint(EndpointName=name)
+    endpoint_production_variants = endpoint_description["ProductionVariants"]
+    assert len(endpoint_production_variants) == 1
+    model_name = endpoint_production_variants[0]["VariantName"]
+    description = sagemaker_client.describe_model(ModelName=model_name)
+
+    tags = sagemaker_client.list_tags(ResourceArn=description["ModelArn"])
+
+    # Extra tags exist besides the ones we set, so avoid strict equality
+    assert all(tag in tags["Tags"] for tag in expected_tags)
+
+
+@pytest.mark.parametrize("proxies_enabled", [True, False])
+@mock_sagemaker_aws_services
+def test_create_deployment_create_sagemaker_and_s3_resources_with_expected_names_and_env_from_local(
+    proxies_enabled, pretrained_model, sagemaker_client, sagemaker_deployment_client, monkeypatch
+):
+    expected_model_environment = {
+        "MLFLOW_DEPLOYMENT_FLAVOR_NAME": "python_function",
+        "SERVING_ENVIRONMENT": "SageMaker",
+        "GUNCORN_CMD_ARGS": '"--timeout 60"',
+        "DISABLE_NGINX": "true",
+    }
+
+    if proxies_enabled:
+        proxy_variables = {
+            "http_proxy": "http://user:password@proxy.example.net:1234",
+            "https_proxy": "https://user:password@proxy.example.net:1234",
+            "no_proxy": "localhost",
+        }
+        for k, v in proxy_variables.items():
+            monkeypatch.setenv(k, v)
+        expected_model_environment.update(proxy_variables)
+        name = "test-app-proxies"
+        sagemaker_deployment_client.create_deployment(
+            name=name,
+            model_uri=pretrained_model.model_uri,
+            config={
+                "env": {"DISABLE_NGINX": "true", "GUNCORN_CMD_ARGS": '"--timeout 60"'},
+            },
+        )
+    else:
+        name = "test-app"
+        for k in ("http_proxy", "https_proxy", "no_proxy"):
+            monkeypatch.delenv(k, raising=False)
+        sagemaker_deployment_client.create_deployment(
+            name=name,
+            model_uri=pretrained_model.model_uri,
+            config={
+                "env": {"DISABLE_NGINX": "true", "GUNCORN_CMD_ARGS": '"--timeout 60"'},
+            },
+        )
 
     region_name = sagemaker_client.meta.region_name
     s3_client = boto3.client("s3", region_name=region_name)
@@ -342,20 +516,54 @@ def test_create_deployment_create_sagemaker_and_s3_resources_with_expected_names
     model_environment = sagemaker_client.describe_model(ModelName=model_name)["PrimaryContainer"][
         "Environment"
     ]
-    assert model_environment == {
-        "MLFLOW_DEPLOYMENT_FLAVOR_NAME": "python_function",
-        "SERVING_ENVIRONMENT": "SageMaker",
-    }
+
+    assert model_environment == expected_model_environment
 
 
-@pytest.mark.large
+@pytest.mark.parametrize("proxies_enabled", [True, False])
 @mock_sagemaker_aws_services
 def test_deploy_cli_creates_sagemaker_and_s3_resources_with_expected_names_and_env_from_local(
-    pretrained_model, sagemaker_client
+    proxies_enabled, pretrained_model, sagemaker_client
 ):
-    app_name = "test-app"
     region_name = sagemaker_client.meta.region_name
-    create_sagemaker_deployment_through_cli(app_name, pretrained_model.model_uri, region_name)
+    environment_variables = {"LC_ALL": "en_US.UTF-8", "LANG": "en_US.UTF-8"}
+    override_environment_variables = {"DISABLE_NGINX": "true", "GUNCORN_CMD_ARGS": '"--timeout 60"'}
+    expected_model_environment = {
+        "MLFLOW_DEPLOYMENT_FLAVOR_NAME": "python_function",
+        "SERVING_ENVIRONMENT": "SageMaker",
+        "GUNCORN_CMD_ARGS": '"--timeout 60"',
+        "DISABLE_NGINX": "true",
+    }
+
+    if proxies_enabled:
+        proxy_variables = {
+            "http_proxy": "http://user:password@proxy.example.net:1234",
+            "https_proxy": "http://user:password@proxy.example.net:1234",
+            "no_proxy": "localhost",
+        }
+        expected_model_environment.update(proxy_variables)
+        app_name = "test-app-proxies"
+        create_sagemaker_deployment_through_cli(
+            app_name,
+            pretrained_model.model_uri,
+            region_name,
+            {**environment_variables, **proxy_variables},
+            config=[f"env={json.dumps(override_environment_variables)}"],
+        )
+    else:
+        proxy_variables = {
+            "http_proxy": None,
+            "https_proxy": None,
+            "no_proxy": None,
+        }
+        app_name = "test-app"
+        create_sagemaker_deployment_through_cli(
+            app_name,
+            pretrained_model.model_uri,
+            region_name,
+            {**environment_variables, **proxy_variables},
+            config=[f"env={json.dumps(override_environment_variables)}"],
+        )
 
     s3_client = boto3.client("s3", region_name=region_name)
     default_bucket = mfs._get_default_s3_bucket(region_name)
@@ -378,32 +586,77 @@ def test_deploy_cli_creates_sagemaker_and_s3_resources_with_expected_names_and_e
     model_environment = sagemaker_client.describe_model(ModelName=model_name)["PrimaryContainer"][
         "Environment"
     ]
-    assert model_environment == {
-        "MLFLOW_DEPLOYMENT_FLAVOR_NAME": "python_function",
-        "SERVING_ENVIRONMENT": "SageMaker",
-    }
+
+    assert model_environment == expected_model_environment
 
 
-@pytest.mark.large
+@mock_sagemaker_aws_services
+def test_deploy_cli_creates_sagemaker_and_s3_resources_with_expected_tags_from_local(
+    pretrained_model, sagemaker_client
+):
+    expected_tags = [{"Key": "key1", "Value": "value1"}, {"Key": "key2", "Value": "value2"}]
+    region_name = sagemaker_client.meta.region_name
+
+    app_name = "test-app"
+    create_sagemaker_deployment_through_cli(
+        app_name,
+        pretrained_model.model_uri,
+        region_name,
+        env=None,
+        config=["tags={}".format(json.dumps({"key1": "value1", "key2": "value2"}))],
+    )
+
+    endpoint_description = sagemaker_client.describe_endpoint(EndpointName=app_name)
+    endpoint_production_variants = endpoint_description["ProductionVariants"]
+    assert len(endpoint_production_variants) == 1
+    model_name = endpoint_production_variants[0]["VariantName"]
+    description = sagemaker_client.describe_model(ModelName=model_name)
+
+    tags = sagemaker_client.list_tags(ResourceArn=description["ModelArn"])
+
+    # Extra tags exist besides the ones we set, so avoid strict equality
+    assert all(tag in tags["Tags"] for tag in expected_tags)
+
+
+@pytest.mark.parametrize("proxies_enabled", [True, False])
 @mock_sagemaker_aws_services
 def test_create_deployment_creates_sagemaker_and_s3_resources_with_expected_names_and_env_from_s3(
-    pretrained_model, sagemaker_client, sagemaker_deployment_client
+    proxies_enabled, pretrained_model, sagemaker_client, sagemaker_deployment_client, monkeypatch
 ):
     local_model_path = _download_artifact_from_uri(pretrained_model.model_uri)
     artifact_path = "model"
     region_name = sagemaker_client.meta.region_name
     default_bucket = mfs._get_default_s3_bucket(region_name)
-    s3_artifact_repo = S3ArtifactRepository("s3://{}".format(default_bucket))
+    s3_artifact_repo = S3ArtifactRepository(f"s3://{default_bucket}")
     s3_artifact_repo.log_artifacts(local_model_path, artifact_path=artifact_path)
-    model_s3_uri = "s3://{bucket_name}/{artifact_path}".format(
-        bucket_name=default_bucket, artifact_path=pretrained_model.model_path
-    )
+    model_s3_uri = f"s3://{default_bucket}/{pretrained_model.model_path}"
+    expected_model_environment = {
+        "MLFLOW_DEPLOYMENT_FLAVOR_NAME": "python_function",
+        "SERVING_ENVIRONMENT": "SageMaker",
+    }
 
-    name = "test-app"
-    sagemaker_deployment_client.create_deployment(
-        name=name,
-        model_uri=model_s3_uri,
-    )
+    if proxies_enabled:
+        proxy_variables = {
+            "http_proxy": "http://user:password@proxy.example.net:1234",
+            "https_proxy": "http://user:password@proxy.example.net:1234",
+            "no_proxy": "localhost",
+        }
+        for k, v in proxy_variables.items():
+            monkeypatch.setenv(k, v)
+        expected_model_environment.update(proxy_variables)
+        name = "test-app-proxies"
+        sagemaker_deployment_client.create_deployment(
+            name=name,
+            model_uri=model_s3_uri,
+        )
+    else:
+        for k in ("http_proxy", "https_proxy", "no_proxy"):
+            monkeypatch.delenv(k, raising=False)
+        name = "test-app"
+        sagemaker_deployment_client.create_deployment(
+            name=name,
+            model_uri=model_s3_uri,
+        )
 
     endpoint_description = sagemaker_client.describe_endpoint(EndpointName=name)
     endpoint_production_variants = endpoint_description["ProductionVariants"]
@@ -426,29 +679,55 @@ def test_create_deployment_creates_sagemaker_and_s3_resources_with_expected_name
     model_environment = sagemaker_client.describe_model(ModelName=model_name)["PrimaryContainer"][
         "Environment"
     ]
-    assert model_environment == {
-        "MLFLOW_DEPLOYMENT_FLAVOR_NAME": "python_function",
-        "SERVING_ENVIRONMENT": "SageMaker",
-    }
+
+    assert model_environment == expected_model_environment
 
 
-@pytest.mark.large
+@pytest.mark.parametrize("proxies_enabled", [True, False])
 @mock_sagemaker_aws_services
 def test_deploy_cli_creates_sagemaker_and_s3_resources_with_expected_names_and_env_from_s3(
-    pretrained_model, sagemaker_client
+    proxies_enabled, pretrained_model, sagemaker_client
 ):
     local_model_path = _download_artifact_from_uri(pretrained_model.model_uri)
     artifact_path = "model"
     region_name = sagemaker_client.meta.region_name
     default_bucket = mfs._get_default_s3_bucket(region_name)
-    s3_artifact_repo = S3ArtifactRepository("s3://{}".format(default_bucket))
+    s3_artifact_repo = S3ArtifactRepository(f"s3://{default_bucket}")
     s3_artifact_repo.log_artifacts(local_model_path, artifact_path=artifact_path)
-    model_s3_uri = "s3://{bucket_name}/{artifact_path}".format(
-        bucket_name=default_bucket, artifact_path=pretrained_model.model_path
-    )
+    model_s3_uri = f"s3://{default_bucket}/{pretrained_model.model_path}"
+    environment_variables = {"LC_ALL": "en_US.UTF-8", "LANG": "en_US.UTF-8"}
+    expected_model_environment = {
+        "MLFLOW_DEPLOYMENT_FLAVOR_NAME": "python_function",
+        "SERVING_ENVIRONMENT": "SageMaker",
+    }
 
-    app_name = "test-app"
-    create_sagemaker_deployment_through_cli(app_name, model_s3_uri, region_name)
+    if proxies_enabled:
+        proxy_variables = {
+            "http_proxy": "http://user:password@proxy.example.net:1234",
+            "https_proxy": "https://user:password@proxy.example.net:1234",
+            "no_proxy": "localhost",
+        }
+        expected_model_environment.update(proxy_variables)
+        app_name = "test-app-proxies"
+        create_sagemaker_deployment_through_cli(
+            app_name,
+            model_s3_uri,
+            region_name,
+            {**environment_variables, **proxy_variables},
+        )
+    else:
+        proxy_variables = {
+            "http_proxy": None,
+            "https_proxy": None,
+            "no_proxy": None,
+        }
+        app_name = "test-app"
+        create_sagemaker_deployment_through_cli(
+            app_name,
+            model_s3_uri,
+            region_name,
+            {**environment_variables, **proxy_variables},
+        )
 
     region_name = sagemaker_client.meta.region_name
     s3_client = boto3.client("s3", region_name=region_name)
@@ -472,13 +751,10 @@ def test_deploy_cli_creates_sagemaker_and_s3_resources_with_expected_names_and_e
     model_environment = sagemaker_client.describe_model(ModelName=model_name)["PrimaryContainer"][
         "Environment"
     ]
-    assert model_environment == {
-        "MLFLOW_DEPLOYMENT_FLAVOR_NAME": "python_function",
-        "SERVING_ENVIRONMENT": "SageMaker",
-    }
+
+    assert model_environment == expected_model_environment
 
 
-@pytest.mark.large
 @mock_sagemaker_aws_services
 def test_create_deployment_with_preexisting_name_throws_exception(
     pretrained_model, sagemaker_deployment_client
@@ -501,7 +777,6 @@ def test_create_deployment_with_preexisting_name_throws_exception(
     assert exc.value.error_code == ErrorCode.Name(INVALID_PARAMETER_VALUE)
 
 
-@pytest.mark.large
 @mock_sagemaker_aws_services
 def test_create_deployment_in_sync_mode_waits_for_endpoint_creation_to_complete_before_returning(
     pretrained_model, sagemaker_client, sagemaker_deployment_client
@@ -516,7 +791,7 @@ def test_create_deployment_in_sync_mode_waits_for_endpoint_creation_to_complete_
     sagemaker_deployment_client.create_deployment(
         name=name,
         model_uri=pretrained_model.model_uri,
-        config=dict(synchronous=True),
+        config={"synchronous": True},
     )
     deployment_end_time = time.time()
 
@@ -525,7 +800,6 @@ def test_create_deployment_in_sync_mode_waits_for_endpoint_creation_to_complete_
     assert endpoint_description["EndpointStatus"] == Endpoint.STATUS_IN_SERVICE
 
 
-@pytest.mark.large
 @mock_sagemaker_aws_services
 def test_create_deployment_in_asynchronous_mode_returns_before_endpoint_creation_completes(
     pretrained_model, sagemaker_client, sagemaker_deployment_client
@@ -540,7 +814,7 @@ def test_create_deployment_in_asynchronous_mode_returns_before_endpoint_creation
     sagemaker_deployment_client.create_deployment(
         name=name,
         model_uri=pretrained_model.model_uri,
-        config=dict(synchronous=False, archive=True),
+        config={"synchronous": False, "archive": True},
     )
     deployment_end_time = time.time()
 
@@ -549,7 +823,6 @@ def test_create_deployment_in_asynchronous_mode_returns_before_endpoint_creation
     assert endpoint_description["EndpointStatus"] == Endpoint.STATUS_CREATING
 
 
-@pytest.mark.large
 @mock_sagemaker_aws_services
 def test_update_deployment_in_asynchronous_mode_returns_before_endpoint_creation_completes(
     pretrained_model, sagemaker_client, sagemaker_deployment_client
@@ -563,14 +836,14 @@ def test_update_deployment_in_asynchronous_mode_returns_before_endpoint_creation
     sagemaker_deployment_client.create_deployment(
         name=name,
         model_uri=pretrained_model.model_uri,
-        config=dict(synchronous=True),
+        config={"synchronous": True},
     )
 
     update_start_time = time.time()
     sagemaker_deployment_client.update_deployment(
         name=name,
         model_uri=pretrained_model.model_uri,
-        config=dict(mode=mfs.DEPLOYMENT_MODE_REPLACE, synchronous=False, archive=True),
+        config={"mode": mfs.DEPLOYMENT_MODE_REPLACE, "synchronous": False, "archive": True},
     )
     update_end_time = time.time()
 
@@ -579,7 +852,6 @@ def test_update_deployment_in_asynchronous_mode_returns_before_endpoint_creation
     assert endpoint_description["EndpointStatus"] == Endpoint.STATUS_UPDATING
 
 
-@pytest.mark.large
 @mock_sagemaker_aws_services
 def test_create_deployment_throws_exception_after_endpoint_creation_fails(
     pretrained_model, sagemaker_client, sagemaker_deployment_client
@@ -620,7 +892,6 @@ def test_create_deployment_throws_exception_after_endpoint_creation_fails(
     assert exc.value.error_code == ErrorCode.Name(INTERNAL_ERROR)
 
 
-@pytest.mark.large
 @mock_sagemaker_aws_services
 def test_create_deployment_in_replace_mode_removes_preexisting_models_from_endpoint(
     pretrained_model, sagemaker_client, sagemaker_deployment_client
@@ -634,11 +905,11 @@ def test_create_deployment_in_replace_mode_removes_preexisting_models_from_endpo
     sagemaker_deployment_client.update_deployment(
         name=name,
         model_uri=pretrained_model.model_uri,
-        config=dict(
-            mode=mfs.DEPLOYMENT_MODE_ADD,
-            archive=True,
-            synchronous=False,
-        ),
+        config={
+            "mode": mfs.DEPLOYMENT_MODE_ADD,
+            "archive": True,
+            "synchronous": False,
+        },
     )
 
     endpoint_response_before_replacement = sagemaker_client.describe_endpoint(EndpointName=name)
@@ -658,11 +929,11 @@ def test_create_deployment_in_replace_mode_removes_preexisting_models_from_endpo
     sagemaker_deployment_client.update_deployment(
         name=name,
         model_uri=pretrained_model.model_uri,
-        config=dict(
-            mode=mfs.DEPLOYMENT_MODE_REPLACE,
-            archive=True,
-            synchronous=False,
-        ),
+        config={
+            "mode": mfs.DEPLOYMENT_MODE_REPLACE,
+            "archive": True,
+            "synchronous": False,
+        },
     )
 
     endpoint_response_after_replacement = sagemaker_client.describe_endpoint(EndpointName=name)
@@ -685,7 +956,6 @@ def test_create_deployment_in_replace_mode_removes_preexisting_models_from_endpo
     )
 
 
-@pytest.mark.large
 @mock_sagemaker_aws_services
 def test_create_deployment_in_add_mode_adds_new_model_to_existing_endpoint(
     pretrained_model, sagemaker_client, sagemaker_deployment_client
@@ -699,11 +969,11 @@ def test_create_deployment_in_add_mode_adds_new_model_to_existing_endpoint(
     sagemaker_deployment_client.update_deployment(
         name=name,
         model_uri=pretrained_model.model_uri,
-        config=dict(
-            mode=mfs.DEPLOYMENT_MODE_ADD,
-            archive=True,
-            synchronous=False,
-        ),
+        config={
+            "mode": mfs.DEPLOYMENT_MODE_ADD,
+            "archive": True,
+            "synchronous": False,
+        },
     )
     models_added = 2
 
@@ -723,13 +993,12 @@ def test_update_deployment_with_create_mode_raises_exception(
         sagemaker_deployment_client.update_deployment(
             name="invalid mode",
             model_uri=pretrained_model.model_uri,
-            config=dict(mode=mfs.DEPLOYMENT_MODE_CREATE),
+            config={"mode": mfs.DEPLOYMENT_MODE_CREATE},
         )
 
     assert exc.value.error_code == ErrorCode.Name(INVALID_PARAMETER_VALUE)
 
 
-@pytest.mark.large
 @mock_sagemaker_aws_services
 def test_update_deployment_in_add_mode_adds_new_model_to_existing_endpoint(
     pretrained_model, sagemaker_client, sagemaker_deployment_client
@@ -744,11 +1013,11 @@ def test_update_deployment_in_add_mode_adds_new_model_to_existing_endpoint(
         sagemaker_deployment_client.update_deployment(
             name=name,
             model_uri=pretrained_model.model_uri,
-            config=dict(
-                mode=mfs.DEPLOYMENT_MODE_ADD,
-                archive=True,
-                synchronous=False,
-            ),
+            config={
+                "mode": mfs.DEPLOYMENT_MODE_ADD,
+                "archive": True,
+                "synchronous": False,
+            },
         )
         models_added += 1
 
@@ -761,7 +1030,6 @@ def test_update_deployment_in_add_mode_adds_new_model_to_existing_endpoint(
     assert len(production_variants) == models_added
 
 
-@pytest.mark.large
 @mock_sagemaker_aws_services
 def test_update_deployment_in_replace_mode_removes_preexisting_models_from_endpoint(
     pretrained_model, sagemaker_client, sagemaker_deployment_client
@@ -776,11 +1044,11 @@ def test_update_deployment_in_replace_mode_removes_preexisting_models_from_endpo
         sagemaker_deployment_client.update_deployment(
             name=name,
             model_uri=pretrained_model.model_uri,
-            config=dict(
-                mode=mfs.DEPLOYMENT_MODE_ADD,
-                archive=True,
-                synchronous=False,
-            ),
+            config={
+                "mode": mfs.DEPLOYMENT_MODE_ADD,
+                "archive": True,
+                "synchronous": False,
+            },
         )
 
     endpoint_response_before_replacement = sagemaker_client.describe_endpoint(EndpointName=name)
@@ -800,11 +1068,11 @@ def test_update_deployment_in_replace_mode_removes_preexisting_models_from_endpo
     sagemaker_deployment_client.update_deployment(
         name=name,
         model_uri=pretrained_model.model_uri,
-        config=dict(
-            mode=mfs.DEPLOYMENT_MODE_REPLACE,
-            archive=True,
-            synchronous=False,
-        ),
+        config={
+            "mode": mfs.DEPLOYMENT_MODE_REPLACE,
+            "archive": True,
+            "synchronous": False,
+        },
     )
 
     endpoint_response_after_replacement = sagemaker_client.describe_endpoint(EndpointName=name)
@@ -827,7 +1095,6 @@ def test_update_deployment_in_replace_mode_removes_preexisting_models_from_endpo
     )
 
 
-@pytest.mark.large
 @mock_sagemaker_aws_services
 def test_update_deployment_in_replace_mode_throws_exception_after_endpoint_update_fails(
     pretrained_model, sagemaker_client, sagemaker_deployment_client
@@ -868,12 +1135,11 @@ def test_update_deployment_in_replace_mode_throws_exception_after_endpoint_updat
         sagemaker_deployment_client.update_deployment(
             name=name,
             model_uri=pretrained_model.model_uri,
-            config=dict(mode=mfs.DEPLOYMENT_MODE_REPLACE),
+            config={"mode": mfs.DEPLOYMENT_MODE_REPLACE},
         )
     assert exc.value.error_code == ErrorCode.Name(INTERNAL_ERROR)
 
 
-@pytest.mark.large
 @mock_sagemaker_aws_services
 def test_update_deployment_waits_for_endpoint_update_completion_before_deleting_resources(
     pretrained_model, sagemaker_client, sagemaker_deployment_client
@@ -915,11 +1181,10 @@ def test_update_deployment_waits_for_endpoint_update_completion_before_deleting_
         sagemaker_deployment_client.update_deployment(
             name=name,
             model_uri=pretrained_model.model_uri,
-            config=dict(mode=mfs.DEPLOYMENT_MODE_REPLACE, archive=False),
+            config={"mode": mfs.DEPLOYMENT_MODE_REPLACE, "archive": False},
         )
 
 
-@pytest.mark.large
 @mock_sagemaker_aws_services
 def test_update_deployment_in_replace_mode_with_archiving_does_not_delete_resources(
     pretrained_model, sagemaker_client, sagemaker_deployment_client
@@ -947,20 +1212,16 @@ def test_update_deployment_in_replace_mode_with_archiving_does_not_delete_resour
         model["ModelName"] for model in sagemaker_client.list_models()["Models"]
     ]
 
-    model_uri = "runs:/{run_id}/{artifact_path}".format(
-        run_id=pretrained_model.run_id, artifact_path=pretrained_model.model_path
-    )
+    model_uri = f"runs:/{pretrained_model.run_id}/{pretrained_model.model_path}"
     sk_model = mlflow.sklearn.load_model(model_uri=model_uri)
     new_artifact_path = "model"
     with mlflow.start_run():
         mlflow.sklearn.log_model(sk_model=sk_model, artifact_path=new_artifact_path)
-        new_model_uri = "runs:/{run_id}/{artifact_path}".format(
-            run_id=mlflow.active_run().info.run_id, artifact_path=new_artifact_path
-        )
+        new_model_uri = f"runs:/{mlflow.active_run().info.run_id}/{new_artifact_path}"
     sagemaker_deployment_client.update_deployment(
         name=name,
         model_uri=new_model_uri,
-        config=dict(mode=mfs.DEPLOYMENT_MODE_REPLACE, archive=True, synchronous=True),
+        config={"mode": mfs.DEPLOYMENT_MODE_REPLACE, "archive": True, "synchronous": True},
     )
 
     object_names_after_replacement = [
@@ -984,7 +1245,6 @@ def test_update_deployment_in_replace_mode_with_archiving_does_not_delete_resour
     assert all(model in models_after_replacement for model in models_before_replacement)
 
 
-@pytest.mark.large
 @mock_sagemaker_aws_services
 def test_deploy_cli_updates_sagemaker_and_s3_resources_in_replace_mode(
     pretrained_model, sagemaker_client
@@ -1028,13 +1288,22 @@ def test_deploy_cli_updates_sagemaker_and_s3_resources_in_replace_mode(
     model_environment = sagemaker_client.describe_model(ModelName=model_name)["PrimaryContainer"][
         "Environment"
     ]
-    assert model_environment == {
+    expected_model_environment = {
         "MLFLOW_DEPLOYMENT_FLAVOR_NAME": "python_function",
         "SERVING_ENVIRONMENT": "SageMaker",
     }
+    if os.getenv("http_proxy") is not None:
+        expected_model_environment.update({"http_proxy": os.environ["http_proxy"]})
+
+    if os.getenv("https_proxy") is not None:
+        expected_model_environment.update({"https_proxy": os.environ["https_proxy"]})
+
+    if os.getenv("no_proxy") is not None:
+        expected_model_environment.update({"no_proxy": os.environ["no_proxy"]})
+
+    assert model_environment == expected_model_environment
 
 
-@pytest.mark.large
 @mock_sagemaker_aws_services
 def test_deploy_cli_updates_sagemaker_and_s3_resources_in_add_mode(
     pretrained_model, sagemaker_client
@@ -1069,13 +1338,12 @@ def test_delete_deployment_in_asynchronous_mode_without_archiving_raises_excepti
 ):
     with pytest.raises(MlflowException, match="Resources must be archived") as exc:
         sagemaker_deployment_client.delete_deployment(
-            name="dummy", config=dict(archive=False, synchronous=False)
+            name="dummy", config={"archive": False, "synchronous": False}
         )
 
     assert exc.value.error_code == ErrorCode.Name(INVALID_PARAMETER_VALUE)
 
 
-@pytest.mark.large
 @mock_sagemaker_aws_services
 def test_delete_deployment_synchronous_mode_without_archiving_deletes_all_resources(
     pretrained_model, sagemaker_client, sagemaker_deployment_client
@@ -1084,11 +1352,11 @@ def test_delete_deployment_synchronous_mode_without_archiving_deletes_all_resour
     region_name = sagemaker_client.meta.region_name
 
     sagemaker_deployment_client.create_deployment(
-        name=name, model_uri=pretrained_model.model_uri, config=dict(region_name=region_name)
+        name=name, model_uri=pretrained_model.model_uri, config={"region_name": region_name}
     )
 
     sagemaker_deployment_client.delete_deployment(
-        name=name, config=dict(archive=False, synchronous=True, region_name=region_name)
+        name=name, config={"archive": False, "synchronous": True, "region_name": region_name}
     )
 
     s3_client = boto3.client("s3", region_name=region_name)
@@ -1104,7 +1372,6 @@ def test_delete_deployment_synchronous_mode_without_archiving_deletes_all_resour
     assert len(models["Models"]) == 0
 
 
-@pytest.mark.large
 @mock_sagemaker_aws_services
 def test_delete_deployment_synchronous_with_archiving_only_deletes_endpoint(
     pretrained_model, sagemaker_client, sagemaker_deployment_client
@@ -1113,11 +1380,11 @@ def test_delete_deployment_synchronous_with_archiving_only_deletes_endpoint(
     region_name = sagemaker_client.meta.region_name
 
     sagemaker_deployment_client.create_deployment(
-        name=name, model_uri=pretrained_model.model_uri, config=dict(region_name=region_name)
+        name=name, model_uri=pretrained_model.model_uri, config={"region_name": region_name}
     )
 
     sagemaker_deployment_client.delete_deployment(
-        name=name, config=dict(archive=True, synchronous=True, region_name=region_name)
+        name=name, config={"archive": True, "synchronous": True, "region_name": region_name}
     )
 
     s3_client = boto3.client("s3", region_name=region_name)
@@ -1133,7 +1400,6 @@ def test_delete_deployment_synchronous_with_archiving_only_deletes_endpoint(
     assert len(models["Models"]) > 0
 
 
-@pytest.mark.large
 @mock_sagemaker_aws_services
 def test_deploy_cli_deletes_sagemaker_deployment(pretrained_model, sagemaker_client):
     app_name = "test-app"
@@ -1158,14 +1424,13 @@ def test_deploy_cli_deletes_sagemaker_deployment(pretrained_model, sagemaker_cli
     assert len(response["Endpoints"]) == 0
 
 
-@pytest.mark.large
 @mock_sagemaker_aws_services
 def test_get_deployment_successful(pretrained_model, sagemaker_client):
     name = "test-app"
     region_name = sagemaker_client.meta.region_name
     sagemaker_deployment_client = mfs.SageMakerDeploymentClient(f"sagemaker:/{region_name}")
     sagemaker_deployment_client.create_deployment(
-        name=name, model_uri=pretrained_model.model_uri, config=dict(region_name=region_name)
+        name=name, model_uri=pretrained_model.model_uri, config={"region_name": region_name}
     )
 
     endpoint_description = sagemaker_deployment_client.get_deployment(name)
@@ -1174,7 +1439,6 @@ def test_get_deployment_successful(pretrained_model, sagemaker_client):
     assert endpoint_description == expected_description
 
 
-@pytest.mark.large
 @mock_sagemaker_aws_services
 def test_get_deployment_with_assumed_role_arn(
     pretrained_model, sagemaker_client, sagemaker_deployment_client
@@ -1188,7 +1452,6 @@ def test_get_deployment_with_assumed_role_arn(
     assert endpoint_description == expected_description
 
 
-@pytest.mark.large
 @mock_sagemaker_aws_services
 def test_get_deployment_non_existent_deployment():
     sagemaker_deployment_client = mfs.SageMakerDeploymentClient("sagemaker:/us-west-2")
@@ -1197,7 +1460,6 @@ def test_get_deployment_non_existent_deployment():
         sagemaker_deployment_client.get_deployment("non-existent app")
 
 
-@pytest.mark.large
 @mock_sagemaker_aws_services
 def test_deploy_cli_gets_sagemaker_deployment(pretrained_model, sagemaker_client):
     app_name = "test-app"
@@ -1218,7 +1480,6 @@ def test_deploy_cli_gets_sagemaker_deployment(pretrained_model, sagemaker_client
     assert result.exit_code == 0
 
 
-@pytest.mark.large
 @mock_sagemaker_aws_services
 def test_list_deployments_returns_all_endpoints(pretrained_model, sagemaker_client):
     region_name = sagemaker_client.meta.region_name
@@ -1226,12 +1487,12 @@ def test_list_deployments_returns_all_endpoints(pretrained_model, sagemaker_clie
     sagemaker_deployment_client.create_deployment(
         name="test-app-1",
         model_uri=pretrained_model.model_uri,
-        config=dict(region_name=region_name),
+        config={"region_name": region_name},
     )
     sagemaker_deployment_client.create_deployment(
         name="test-app-2",
         model_uri=pretrained_model.model_uri,
-        config=dict(region_name=region_name),
+        config={"region_name": region_name},
     )
 
     endpoints = sagemaker_deployment_client.list_deployments()
@@ -1241,7 +1502,6 @@ def test_list_deployments_returns_all_endpoints(pretrained_model, sagemaker_clie
     assert endpoints[1]["EndpointName"] == "test-app-2"
 
 
-@pytest.mark.large
 @mock_sagemaker_aws_services
 def test_list_deployments_with_assumed_role_arn(pretrained_model, sagemaker_deployment_client):
     sagemaker_deployment_client.create_deployment(
@@ -1260,7 +1520,6 @@ def test_list_deployments_with_assumed_role_arn(pretrained_model, sagemaker_depl
     assert endpoints[1]["EndpointName"] == "test-app-2"
 
 
-@pytest.mark.large
 @mock_sagemaker_aws_services
 def test_deploy_cli_list_sagemaker_deployments(pretrained_model, sagemaker_client):
     region_name = sagemaker_client.meta.region_name
@@ -1281,24 +1540,25 @@ def test_deploy_cli_list_sagemaker_deployments(pretrained_model, sagemaker_clien
 
 @mock_sagemaker_aws_services
 def test_predict_with_dataframe_input_output(sagemaker_deployment_client):
-    output_df = pd.DataFrame({1: ["2", ".", "3"]})
+    input_df = pd.DataFrame(data=[[1, 2]], columns=["a", "b"])
+    output_df = pd.DataFrame({"1": ["2", ".", "3"]})
     boto_caller = botocore.client.BaseClient._make_api_call
 
     def mock_invoke_endpoint(self, operation_name, operation_kwargs):
         if operation_name == "InvokeEndpoint":
-            output_json = output_df.to_json(orient="split")
-            result = dict(Body=BytesIO(bytes(output_json, encoding="utf-8")))
+            assert operation_kwargs["Body"] == json.dumps(
+                {"dataframe_split": input_df.to_dict(orient="split")}
+            )
+            output_json = json.dumps({"predictions": output_df.to_dict(orient="records")})
+            result = {"Body": BytesIO(bytes(output_json, encoding="utf-8"))}
         else:
             result = boto_caller(self, operation_name, operation_kwargs)
         return result
 
     with mock.patch("botocore.client.BaseClient._make_api_call", new=mock_invoke_endpoint):
-        df = pd.DataFrame(data=[[1, 2]], columns=["a", "b"])
-
-        result = sagemaker_deployment_client.predict("test", df)
-
+        result = sagemaker_deployment_client.predict("test", input_df).get_predictions()
         assert isinstance(result, pd.DataFrame)
-        assert result.equals(output_df)
+        pd.testing.assert_frame_equal(result, output_df)
 
 
 @mock_sagemaker_aws_services
@@ -1307,13 +1567,14 @@ def test_predict_with_array_input_output(sagemaker_deployment_client):
 
     def mock_invoke_endpoint(self, operation_name, operation_kwargs):
         if operation_name == "InvokeEndpoint":
-            result = dict(Body=BytesIO(b"[1,2,3]"))
+            assert operation_kwargs["Body"] == json.dumps({"instances": list(range(10))})
+            result = {"Body": BytesIO(b'{ "predictions": [1,2,3]}')}
         else:
             result = boto_caller(self, operation_name, operation_kwargs)
         return result
 
     with mock.patch("botocore.client.BaseClient._make_api_call", new=mock_invoke_endpoint):
-        result = sagemaker_deployment_client.predict("test", np.array(range(10)))
+        result = sagemaker_deployment_client.predict("test", np.array(range(10))).get_predictions()
 
         assert isinstance(result, pd.DataFrame)
         assert list(result[0]) == [1, 2, 3]

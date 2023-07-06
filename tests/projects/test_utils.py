@@ -1,8 +1,8 @@
 import git
 import os
 import tempfile
+import zipfile
 
-import requests
 import pytest
 from unittest import mock
 
@@ -32,21 +32,19 @@ from tests.projects.utils import (
 
 def _build_uri(base_uri, subdirectory):
     if subdirectory != "":
-        return "%s#%s" % (base_uri, subdirectory)
+        return f"{base_uri}#{subdirectory}"
     return base_uri
 
 
 @pytest.fixture
-def zipped_repo(tmpdir):
-    import zipfile
-
-    zip_name = tmpdir.join("%s.zip" % TEST_PROJECT_NAME).strpath
+def zipped_repo(tmp_path):
+    zip_name = tmp_path.joinpath("%s.zip" % TEST_PROJECT_NAME)
     with zipfile.ZipFile(zip_name, "w", zipfile.ZIP_DEFLATED) as zip_file:
         for root, _, files in os.walk(TEST_PROJECT_DIR):
             for file_name in files:
                 file_path = os.path.join(root, file_name)
                 zip_file.write(file_path, file_path[len(TEST_PROJECT_DIR) + len(os.sep) :])
-    return zip_name
+    return str(zip_name)
 
 
 def test_is_zip_uri():
@@ -97,7 +95,7 @@ def test__fetch_project(local_git_repo, local_git_repo_uri, zipped_repo, httpser
 
 
 @pytest.mark.parametrize(
-    "version,expected_version", [(None, "master"), (GIT_PROJECT_BRANCH, GIT_PROJECT_BRANCH)]
+    ("version", "expected_version"), [(None, "master"), (GIT_PROJECT_BRANCH, GIT_PROJECT_BRANCH)]
 )
 def test__fetch_git_repo(local_git_repo, local_git_repo_uri, version, expected_version):
     # Verify that the correct branch is checked out
@@ -108,17 +106,12 @@ def test__fetch_git_repo(local_git_repo, local_git_repo_uri, version, expected_v
 
 @pytest.mark.parametrize(
     "commit",
-    # Fetch the most recent two commits
-    requests.get("https://api.github.com/repos/mlflow/mlflow-example/commits").json()[:2],
+    ["0651d1c962aa35e4dd02608c51a7b0efc2412407", "3c0711f8868232f17a9adbb69fb1186ec8a3c0c7"],
 )
 def test_fetch_git_repo_commit(tmp_path, commit):
-    _fetch_git_repo(
-        "https://github.com/mlflow/mlflow-example.git",
-        commit["sha"],
-        tmp_path,
-    )
+    _fetch_git_repo("https://github.com/mlflow/mlflow-example.git", commit, tmp_path)
     repo = git.Repo(tmp_path)
-    assert repo.commit().hexsha == commit["sha"]
+    assert repo.commit().hexsha == commit
 
 
 def test_fetching_non_existing_version_fails(local_git_repo, local_git_repo_uri):
@@ -137,13 +130,16 @@ def test_fetch_project_validations(local_git_repo_uri):
         _fetch_project(uri=TEST_PROJECT_DIR, version="version")
 
 
-def test_dont_remove_mlruns(tmpdir):
+def test_dont_remove_mlruns(tmp_path):
     # Fetching a directory containing an "mlruns" folder doesn't remove the "mlruns" folder
-    src_dir = tmpdir.mkdir("mlruns-src-dir")
-    src_dir.mkdir("mlruns").join("some-file.txt").write("hi")
-    src_dir.join("MLproject").write("dummy MLproject contents")
-    dst_dir = _fetch_project(uri=src_dir.strpath, version=None)
-    assert_dirs_equal(expected=src_dir.strpath, actual=dst_dir)
+    src_dir = tmp_path.joinpath("mlruns-src-dir")
+    src_dir.mkdir()
+    mlruns = src_dir.joinpath("mlruns")
+    mlruns.mkdir()
+    mlruns.joinpath("some-file.txt").write_text("hi")
+    src_dir.joinpath("MLproject").write_text("dummy MLproject contents")
+    dst_dir = _fetch_project(uri=str(src_dir), version=None)
+    assert_dirs_equal(expected=str(src_dir), actual=dst_dir)
 
 
 def test_parse_subdirectory():
@@ -165,12 +161,12 @@ def test_parse_subdirectory():
         _parse_subdirectory(period_fail_uri)
 
 
-def test_storage_dir(tmpdir):
+def test_storage_dir(tmp_path):
     """
     Test that we correctly handle the `storage_dir` argument, which specifies where to download
     distributed artifacts passed to arguments of type `path`.
     """
-    assert os.path.dirname(_get_storage_dir(tmpdir.strpath)) == tmpdir.strpath
+    assert os.path.dirname(_get_storage_dir(tmp_path)) == str(tmp_path)
     assert os.path.dirname(_get_storage_dir(None)) == tempfile.gettempdir()
 
 
@@ -179,17 +175,21 @@ def test_is_valid_branch_name(local_git_repo):
     assert not _is_valid_branch_name(local_git_repo, "dev")
 
 
-def test_fetch_create_and_log(tmpdir):
+def test_fetch_create_and_log(tmp_path):
     entry_point_name = "entry_point"
     parameters = {
         "method_name": "string",
     }
     entry_point = _project_spec.EntryPoint(entry_point_name, parameters, "run_model.sh")
     mock_fetched_project = _project_spec.Project(
-        None, {entry_point_name: entry_point}, None, "my_project"
+        env_type="local",
+        env_config_path=None,
+        entry_points={entry_point_name: entry_point},
+        docker_env=None,
+        name="my_project",
     )
     experiment_id = mlflow.create_experiment("test_fetch_project")
-    expected_dir = tmpdir
+    expected_dir = str(tmp_path)
     project_uri = "http://someuri/myproject.git"
     user_param = {"method_name": "newton"}
     with mock.patch("mlflow.projects.utils._fetch_project", return_value=expected_dir):

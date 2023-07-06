@@ -35,9 +35,9 @@ def _assert_schema_files_equal(generated_schema_file, expected_schema_file):
     """
     # Extract "CREATE TABLE" statement chunks from both files, assuming tables are listed in the
     # same order across files
-    with open(generated_schema_file, "r") as generated_schema_handle:
+    with open(generated_schema_file) as generated_schema_handle:
         generated_schema_table_chunks = generated_schema_handle.read().split("\n\n")
-    with open(expected_schema_file, "r") as expected_schema_handle:
+    with open(expected_schema_file) as expected_schema_handle:
         expected_schema_table_chunks = expected_schema_handle.read().split("\n\n")
     # Compare the two files table-by-table. We assume each CREATE TABLE statement is valid and
     # so sort the lines within the statements before comparing them.
@@ -48,14 +48,10 @@ def _assert_schema_files_equal(generated_schema_file, expected_schema_file):
         expected_lines = [x.strip() for x in sorted(expected_schema_table.split("\n"))]
         assert generated_lines == expected_lines, (
             "Generated schema did not match expected schema. Generated schema had table "
-            "definition:\n{generated_table}\nExpected schema had table definition:"
-            "\n{expected_table}\nIf you intended to make schema changes, run "
-            "'python tests/store/dump_schema.py {expected_file}' from your checkout of MLflow to "
-            "update the schema snapshot.".format(
-                generated_table=generated_schema_table,
-                expected_table=expected_schema_table,
-                expected_file=expected_schema_file,
-            )
+            f"definition:\n{generated_schema_table}\nExpected schema had table definition:"
+            f"\n{expected_schema_table}\nIf you intended to make schema changes, run "
+            f"'python tests/store/dump_schema.py {expected_schema_file}' from your checkout"
+            " of MLflow to update the schema snapshot."
         )
 
 
@@ -68,35 +64,34 @@ def expected_schema_file():
 
 
 @pytest.fixture()
-def db_url(tmpdir):
-    return "sqlite:///%s" % tmpdir.join("db_file").strpath
+def db_url(tmp_path):
+    db_file = tmp_path.joinpath("db_file")
+    return f"sqlite:///{db_file}"
 
 
 def test_sqlalchemystore_idempotently_generates_up_to_date_schema(
-    tmpdir, db_url, expected_schema_file
+    tmp_path, db_url, expected_schema_file
 ):
-    generated_schema_file = tmpdir.join("generated-schema.sql").strpath
+    generated_schema_file = tmp_path.joinpath("generated-schema.sql")
     # Repeatedly initialize a SQLAlchemyStore against the same DB URL. Initialization should
     # succeed and the schema should be the same.
     for _ in range(3):
-        SqlAlchemyStore(db_url, tmpdir.join("ARTIFACTS").strpath)
+        SqlAlchemyStore(db_url, tmp_path.joinpath("ARTIFACTS").as_uri())
         dump_db_schema(db_url, dst_file=generated_schema_file)
         _assert_schema_files_equal(generated_schema_file, expected_schema_file)
 
 
-def test_running_migrations_generates_expected_schema(tmpdir, expected_schema_file, db_url):
+def test_running_migrations_generates_expected_schema(tmp_path, expected_schema_file, db_url):
     """Test that migrating an existing database generates the desired schema."""
     engine = sqlalchemy.create_engine(db_url)
     InitialBase.metadata.create_all(engine)
     invoke_cli_runner(mlflow.db.commands, ["upgrade", db_url])
-    generated_schema_file = tmpdir.join("generated-schema.sql").strpath
+    generated_schema_file = tmp_path.joinpath("generated-schema.sql")
     dump_db_schema(db_url, generated_schema_file)
     _assert_schema_files_equal(generated_schema_file, expected_schema_file)
 
 
-def test_sqlalchemy_store_detects_schema_mismatch(
-    tmpdir, db_url
-):  # pylint: disable=unused-argument
+def test_sqlalchemy_store_detects_schema_mismatch(db_url):
     def _assert_invalid_schema(engine):
         with pytest.raises(MlflowException, match="Detected out-of-date database schema."):
             _verify_schema(engine)
@@ -120,23 +115,23 @@ def test_sqlalchemy_store_detects_schema_mismatch(
     _verify_schema(engine)
 
 
-def test_store_generated_schema_matches_base(tmpdir, db_url):
+def test_store_generated_schema_matches_base(tmp_path, db_url):
     # Create a SQLAlchemyStore against tmpfile, directly verify that tmpfile contains a
     # database with a valid schema
-    SqlAlchemyStore(db_url, tmpdir.join("ARTIFACTS").strpath)
+    SqlAlchemyStore(db_url, tmp_path.joinpath("ARTIFACTS").as_uri())
     engine = sqlalchemy.create_engine(db_url)
     mc = MigrationContext.configure(engine.connect())
     diff = compare_metadata(mc, Base.metadata)
     # `diff` contains several `remove_index` operations because `Base.metadata` does not contain
     # index metadata but `mc` does. Note this doesn't mean the MLflow database is missing indexes
     # as tested in `test_create_index_on_run_uuid`.
-    diff = [d for d in diff if d[0] != "remove_index"]
+    diff = [d for d in diff if (d[0] not in ["remove_index", "add_index", "add_fk"])]
     assert len(diff) == 0
 
 
-def test_create_index_on_run_uuid(tmpdir, db_url):
+def test_create_index_on_run_uuid(tmp_path, db_url):
     # Test for mlflow/store/db_migrations/versions/bd07f7e963c5_create_index_on_run_uuid.py
-    SqlAlchemyStore(db_url, tmpdir.join("ARTIFACTS").strpath)
+    SqlAlchemyStore(db_url, tmp_path.joinpath("ARTIFACTS").as_uri())
     with sqlite3.connect(db_url[len("sqlite:///") :]) as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT name FROM sqlite_master WHERE type = 'index'")
@@ -148,3 +143,18 @@ def test_create_index_on_run_uuid(tmpdir, db_url):
             "index_tags_run_uuid",
         }
         assert run_uuid_index_names.issubset(all_index_names)
+
+
+def test_index_for_dataset_tables(tmp_path, db_url):
+    # Test for mlflow/store/db_migrations/versions/7f2a7d5fae7d_add_datasets_inputs_input_tags_tables.py # pylint: disable=line-too-long
+    SqlAlchemyStore(db_url, tmp_path.joinpath("ARTIFACTS").as_uri())
+    with sqlite3.connect(db_url[len("sqlite:///") :]) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type = 'index'")
+        all_index_names = [r[0] for r in cursor.fetchall()]
+        new_index_names = {
+            "index_datasets_experiment_id_dataset_source_type",
+            "index_inputs_input_uuid",
+            "index_inputs_destination_type_destination_id_source_type",
+        }
+        assert new_index_names.issubset(all_index_names)

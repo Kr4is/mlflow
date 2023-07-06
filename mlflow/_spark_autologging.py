@@ -6,11 +6,9 @@ import uuid
 
 from py4j.java_gateway import CallbackServerParameters
 
-from pyspark import SparkContext
-
 import mlflow
+from mlflow import MlflowClient
 from mlflow.exceptions import MlflowException
-from mlflow.tracking.client import MlflowClient
 from mlflow.tracking.context.abstract_context import RunContextProvider
 from mlflow.utils import _truncate_and_ellipsize
 from mlflow.utils.autologging_utils import (
@@ -42,10 +40,8 @@ def _get_current_listener():
 
 def _get_table_info_string(path, version, data_format):
     if data_format == "delta":
-        return "path={path},version={version},format={format}".format(
-            path=path, version=version, format=data_format
-        )
-    return "path={path},format={format}".format(path=path, format=data_format)
+        return f"path={path},version={version},format={data_format}"
+    return f"path={path},format={data_format}"
 
 
 def _merge_tag_lines(existing_tag, new_table_info):
@@ -69,14 +65,14 @@ def _get_spark_major_version(sc):
     return spark_major_version
 
 
-def _get_jvm_event_publisher():
+def _get_jvm_event_publisher(spark_context):
     """
     Get JVM-side object implementing the following methods:
     - init() for initializing JVM state needed for autologging (e.g. attaching a SparkListener
       to watch for datasource reads)
     - register(subscriber) for registering subscribers to receive datasource events
     """
-    jvm = SparkContext._gateway.jvm
+    jvm = spark_context._gateway.jvm
     qualified_classname = "{}.{}".format(_JAVA_PACKAGE, "MlflowAutologEventPublisher")
     return getattr(jvm, qualified_classname)
 
@@ -99,6 +95,14 @@ def _set_run_tag(run_id, path, version, data_format):
     new_table_info = _merge_tag_lines(existing_tag, table_info_string)
     new_tag_value = _generate_datasource_tag_value(new_table_info)
     client.set_tag(run_id, _SPARK_TABLE_INFO_TAG_NAME, new_tag_value)
+
+
+def _stop_listen_for_spark_activity(spark_context):
+    gw = spark_context._gateway
+    try:
+        gw.shutdown_callback_server()
+    except Exception as e:
+        _logger.warning("Failed to shut down Spark callback server for autologging: %s", e)
 
 
 def _listen_for_spark_activity(spark_context):
@@ -125,7 +129,7 @@ def _listen_for_spark_activity(spark_context):
     callback_server_started = gw.start_callback_server(callback_server_params)
 
     try:
-        event_publisher = _get_jvm_event_publisher()
+        event_publisher = _get_jvm_event_publisher(spark_context)
         event_publisher.init(1)
         _spark_table_info_listener = PythonSubscriber()
         event_publisher.register(_spark_table_info_listener)
@@ -168,10 +172,10 @@ def _get_repl_id():
     if repl_id:
         return repl_id
     main_file = sys.argv[0] if len(sys.argv) > 0 else "<console>"
-    return "PythonSubscriber[{filename}][{id}]".format(filename=main_file, id=uuid.uuid4().hex)
+    return f"PythonSubscriber[{main_file}][{uuid.uuid4().hex}]"
 
 
-class PythonSubscriber(object, metaclass=ExceptionSafeClass):
+class PythonSubscriber(metaclass=ExceptionSafeClass):
     """
     Subscriber, intended to be instantiated once per Python process, that logs Spark table
     information propagated from Java to the current MLflow run, starting a run if necessary.
@@ -225,7 +229,7 @@ class PythonSubscriber(object, metaclass=ExceptionSafeClass):
         return self._repl_id
 
     class Java:
-        implements = ["{}.MlflowAutologEventSubscriber".format(_JAVA_PACKAGE)]
+        implements = [f"{_JAVA_PACKAGE}.MlflowAutologEventSubscriber"]
 
 
 class SparkAutologgingContext(RunContextProvider):

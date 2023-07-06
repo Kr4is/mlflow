@@ -23,6 +23,7 @@ from mlflow.utils.uri import (
 )
 import mlflow.utils.databricks_utils
 
+# The following constants are defined as @developer_stable
 LIST_API_ENDPOINT = "/api/2.0/dbfs/list"
 GET_STATUS_ENDPOINT = "/api/2.0/dbfs/get-status"
 DOWNLOAD_CHUNK_SIZE = 1024
@@ -93,7 +94,7 @@ class DbfsRestArtifactRepository(ArtifactRepository):
             raise MlflowException("DBFS path %s does not exist" % dbfs_path)
 
     def _get_dbfs_path(self, artifact_path):
-        return "/%s/%s" % (
+        return "/{}/{}".format(
             strip_prefix(self.artifact_uri, "dbfs:/"),
             strip_prefix(artifact_path, "/"),
         )
@@ -122,7 +123,7 @@ class DbfsRestArtifactRepository(ArtifactRepository):
 
     def log_artifacts(self, local_dir, artifact_path=None):
         artifact_path = artifact_path or ""
-        for (dirpath, _, filenames) in os.walk(local_dir):
+        for dirpath, _, filenames in os.walk(local_dir):
             artifact_subdir = artifact_path
             if dirpath != local_dir:
                 rel_path = os.path.relpath(dirpath, local_dir)
@@ -143,8 +144,8 @@ class DbfsRestArtifactRepository(ArtifactRepository):
             json_response = json.loads(response.text)
         except ValueError:
             raise MlflowException(
-                "API request to list files under DBFS path %s failed with status code %s. "
-                "Response body: %s" % (dbfs_path, response.status_code, response.text)
+                f"API request to list files under DBFS path {dbfs_path} failed with "
+                f"status code {response.status_code}. Response body: {response.text}"
             )
         # /api/2.0/dbfs/list will not have the 'files' key in the response for empty directories.
         infos = []

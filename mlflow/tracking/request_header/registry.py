@@ -53,7 +53,7 @@ def resolve_request_headers(request_headers=None):
 
     :param tags: A dictionary of request headers to override. If specified, headers passed in this
         argument will override those inferred from the context.
-    :return: A dicitonary of resolved headers.
+    :return: A dictionary of resolved headers.
     """
 
     all_request_headers = {}
@@ -63,7 +63,7 @@ def resolve_request_headers(request_headers=None):
                 # all_request_headers.update(provider.request_headers())
                 for header, value in provider.request_headers().items():
                     all_request_headers[header] = (
-                        "{} {}".format(all_request_headers[header], value)
+                        f"{all_request_headers[header]} {value}"
                         if header in all_request_headers
                         else value
                     )

@@ -4,6 +4,7 @@ import platform
 import posixpath
 import subprocess
 import sys
+from pathlib import Path
 
 import mlflow
 from mlflow.exceptions import MlflowException
@@ -15,7 +16,6 @@ from mlflow.projects.utils import (
     get_or_create_run,
     load_project,
     get_run_env_vars,
-    get_databricks_env_vars,
     get_entry_point_command,
     MLFLOW_LOCAL_BACKEND_RUN_ID_CONFIG,
     MLFLOW_DOCKER_WORKDIR_PATH,
@@ -23,25 +23,62 @@ from mlflow.projects.utils import (
     PROJECT_SYNCHRONOUS,
     PROJECT_DOCKER_ARGS,
     PROJECT_STORAGE_DIR,
+    PROJECT_BUILD_IMAGE,
+    PROJECT_DOCKER_AUTH,
 )
-from mlflow.utils.conda import get_conda_command, get_or_create_conda_env
+from mlflow.utils.environment import _PythonEnv
+from mlflow.utils.conda import get_or_create_conda_env
+from mlflow.utils.databricks_utils import get_databricks_env_vars
+from mlflow.utils.virtualenv import (
+    _install_python,
+    _create_virtualenv,
+    _get_virtualenv_name,
+    _get_mlflow_virtualenv_root,
+    _get_virtualenv_extra_env_vars,
+    _VIRTUALENV_ENVS_DIR,
+    _PYENV_ROOT_DIR,
+)
 from mlflow.store.artifact.artifact_repository_registry import get_artifact_repository
 from mlflow.store.artifact.azure_blob_artifact_repo import AzureBlobArtifactRepository
 from mlflow.store.artifact.gcs_artifact_repo import GCSArtifactRepository
 from mlflow.store.artifact.hdfs_artifact_repo import HdfsArtifactRepository
 from mlflow.store.artifact.local_artifact_repo import LocalArtifactRepository
 from mlflow.store.artifact.s3_artifact_repo import S3ArtifactRepository
-from mlflow.utils.environment import _EnvManager
+from mlflow.utils import env_manager as _EnvManager
 from mlflow import tracking
 from mlflow.utils.mlflow_tags import MLFLOW_PROJECT_ENV
+from mlflow.projects import env_type
+from mlflow.utils.databricks_utils import is_in_databricks_runtime
+from mlflow.utils.file_utils import get_or_create_nfs_tmp_dir
 
+from mlflow.environment_variables import (
+    MLFLOW_KERBEROS_TICKET_CACHE,
+    MLFLOW_KERBEROS_USER,
+    MLFLOW_PYARROW_EXTRA_CONF,
+)
 
 _logger = logging.getLogger(__name__)
 
 
+def _env_type_to_env_manager(env_typ):
+    if env_typ == env_type.CONDA:
+        return _EnvManager.CONDA
+    elif env_typ == env_type.PYTHON:
+        return _EnvManager.VIRTUALENV
+    elif env_typ == env_type.DOCKER:
+        return _EnvManager.LOCAL
+
+
 class LocalBackend(AbstractBackend):
     def run(
-        self, project_uri, entry_point, params, version, backend_config, tracking_uri, experiment_id
+        self,
+        project_uri,
+        entry_point,
+        params,
+        version,
+        backend_config,
+        tracking_uri,
+        experiment_id,
     ):
         work_dir = fetch_and_validate_project(project_uri, version, entry_point, params)
         project = load_project(work_dir)
@@ -58,6 +95,18 @@ class LocalBackend(AbstractBackend):
         synchronous = backend_config[PROJECT_SYNCHRONOUS]
         docker_args = backend_config[PROJECT_DOCKER_ARGS]
         storage_dir = backend_config[PROJECT_STORAGE_DIR]
+        build_image = backend_config[PROJECT_BUILD_IMAGE]
+        docker_auth = backend_config[PROJECT_DOCKER_AUTH]
+        # Select an appropriate env manager for the project env type
+        if env_manager is None:
+            env_manager = _env_type_to_env_manager(project.env_type)
+        else:
+            if project.env_type == env_type.PYTHON and env_manager == _EnvManager.CONDA:
+                raise MlflowException.invalid_parameter_value(
+                    "python_env project cannot be executed using conda. Set `--env-manager` to "
+                    "'virtualenv' or 'local' to execute this project."
+                )
+
         # If a docker_env attribute is defined in MLproject then it takes precedence over conda yaml
         # environments, so the project will be executed inside a docker container.
         if project.docker_env:
@@ -75,6 +124,8 @@ class LocalBackend(AbstractBackend):
                 repository_uri=project.name,
                 base_image=project.docker_env.get("image"),
                 run_id=active_run.info.run_id,
+                build_image=build_image,
+                docker_auth=docker_auth,
             )
             command_args += _get_docker_command(
                 image=image,
@@ -85,11 +136,44 @@ class LocalBackend(AbstractBackend):
             )
         # Synchronously create a conda environment (even though this may take some time)
         # to avoid failures due to multiple concurrent attempts to create the same conda env.
-        elif env_manager is _EnvManager.CONDA:
+        elif env_manager == _EnvManager.VIRTUALENV:
+            tracking.MlflowClient().set_tag(
+                active_run.info.run_id, MLFLOW_PROJECT_ENV, "virtualenv"
+            )
+            command_separator = " && "
+            if project.env_type == env_type.CONDA:
+                python_env = _PythonEnv.from_conda_yaml(project.env_config_path)
+            else:
+                python_env = (
+                    _PythonEnv.from_yaml(project.env_config_path)
+                    if project.env_config_path
+                    else _PythonEnv()
+                )
+
+            if is_in_databricks_runtime():
+                nfs_tmp_dir = get_or_create_nfs_tmp_dir()
+                env_root = Path(nfs_tmp_dir) / "envs"
+                pyenv_root = env_root / _PYENV_ROOT_DIR
+                virtualenv_root = env_root / _VIRTUALENV_ENVS_DIR
+                env_vars = _get_virtualenv_extra_env_vars(str(env_root))
+            else:
+                pyenv_root = None
+                virtualenv_root = Path(_get_mlflow_virtualenv_root())
+                env_vars = None
+            python_bin_path = _install_python(python_env.python, pyenv_root=pyenv_root)
+            work_dir_path = Path(work_dir)
+            env_name = _get_virtualenv_name(python_env, work_dir_path)
+            env_dir = virtualenv_root / env_name
+            activate_cmd = _create_virtualenv(
+                work_dir_path, python_bin_path, env_dir, python_env, extra_env=env_vars
+            )
+            command_args += [activate_cmd]
+        elif env_manager == _EnvManager.CONDA:
             tracking.MlflowClient().set_tag(active_run.info.run_id, MLFLOW_PROJECT_ENV, "conda")
             command_separator = " && "
-            conda_env_name = get_or_create_conda_env(project.conda_env_path)
-            command_args += get_conda_command(conda_env_name)
+            conda_env = get_or_create_conda_env(project.env_config_path)
+            command_args += conda_env.get_activate_command()
+
         # In synchronous mode, run the entry point command in a blocking fashion, sending status
         # updates to the tracking server when finished. Note that the run state may not be
         # persisted to the tracking server if interrupted
@@ -145,13 +229,13 @@ def _build_mlflow_run_cmd(
     mlflow_run_arr = ["mlflow", "run", uri, "-e", entry_point, "--run-id", run_id]
     if docker_args is not None:
         for key, value in docker_args.items():
-            args = key if isinstance(value, bool) else "%s=%s" % (key, value)
+            args = key if isinstance(value, bool) else f"{key}={value}"
             mlflow_run_arr.extend(["--docker-args", args])
     if storage_dir is not None:
         mlflow_run_arr.extend(["--storage-dir", storage_dir])
-    mlflow_run_arr.extend(["--env-manager", str(env_manager)])
+    mlflow_run_arr.extend(["--env-manager", env_manager])
     for key, value in parameters.items():
-        mlflow_run_arr.extend(["-P", "%s=%s" % (key, value)])
+        mlflow_run_arr.extend(["-P", f"{key}={value}"])
     return mlflow_run_arr
 
 
@@ -240,10 +324,10 @@ def _get_docker_command(image, active_run, docker_args=None, volumes=None, user_
                 system_var = os.environ.get(user_entry)
                 if system_var is None:
                     raise MlflowException(
-                        "This project expects the %s environment variables to "
-                        "be set on the machine running the project, but %s was "
+                        "This project expects the {} environment variables to "
+                        "be set on the machine running the project, but {} was "
                         "not set. Please ensure all expected environment variables "
-                        "are set" % (", ".join(user_env_vars), user_entry)
+                        "are set".format(", ".join(user_env_vars), user_entry)
                     )
                 env_vars[user_entry] = system_var
 
@@ -252,7 +336,7 @@ def _get_docker_command(image, active_run, docker_args=None, volumes=None, user_
             cmd += ["-v", v]
 
     for key, value in env_vars.items():
-        cmd += ["-e", "{key}={value}".format(key=key, value=value)]
+        cmd += ["-e", f"{key}={value}"]
     cmd += [image.tags[0]]
     return cmd
 
@@ -264,7 +348,7 @@ def _get_local_artifact_cmd_and_envs(artifact_repo):
         container_path = os.path.join(MLFLOW_DOCKER_WORKDIR_PATH, container_path)
         container_path = os.path.normpath(container_path)
     abs_artifact_dir = os.path.abspath(artifact_dir)
-    return ["-v", "%s:%s" % (abs_artifact_dir, container_path)], {}
+    return ["-v", f"{abs_artifact_dir}:{container_path}"], {}
 
 
 def _get_s3_artifact_cmd_and_envs(artifact_repo):
@@ -277,14 +361,14 @@ def _get_s3_artifact_cmd_and_envs(artifact_repo):
 
     volumes = []
     if posixpath.exists(aws_path):
-        volumes = ["-v", "%s:%s" % (str(aws_path), "/.aws")]
+        volumes = ["-v", "{}:{}".format(str(aws_path), "/.aws")]
     envs = {
         "AWS_SECRET_ACCESS_KEY": os.environ.get("AWS_SECRET_ACCESS_KEY"),
         "AWS_ACCESS_KEY_ID": os.environ.get("AWS_ACCESS_KEY_ID"),
         "MLFLOW_S3_ENDPOINT_URL": os.environ.get("MLFLOW_S3_ENDPOINT_URL"),
         "MLFLOW_S3_IGNORE_TLS": os.environ.get("MLFLOW_S3_IGNORE_TLS"),
     }
-    envs = dict((k, v) for k, v in envs.items() if v is not None)
+    envs = {k: v for k, v in envs.items() if v is not None}
     return volumes, envs
 
 
@@ -294,7 +378,7 @@ def _get_azure_blob_artifact_cmd_and_envs(artifact_repo):
         "AZURE_STORAGE_CONNECTION_STRING": os.environ.get("AZURE_STORAGE_CONNECTION_STRING"),
         "AZURE_STORAGE_ACCESS_KEY": os.environ.get("AZURE_STORAGE_ACCESS_KEY"),
     }
-    envs = dict((k, v) for k, v in envs.items() if v is not None)
+    envs = {k: v for k, v in envs.items() if v is not None}
     return [], envs
 
 
@@ -305,7 +389,7 @@ def _get_gcs_artifact_cmd_and_envs(artifact_repo):
 
     if "GOOGLE_APPLICATION_CREDENTIALS" in os.environ:
         credentials_path = os.environ["GOOGLE_APPLICATION_CREDENTIALS"]
-        cmds = ["-v", "{}:/.gcs".format(credentials_path)]
+        cmds = ["-v", f"{credentials_path}:/.gcs"]
         envs["GOOGLE_APPLICATION_CREDENTIALS"] = "/.gcs"
     return cmds, envs
 
@@ -314,11 +398,11 @@ def _get_hdfs_artifact_cmd_and_envs(artifact_repo):
     # pylint: disable=unused-argument
     cmds = []
     envs = {
-        "MLFLOW_KERBEROS_TICKET_CACHE": os.environ.get("MLFLOW_KERBEROS_TICKET_CACHE"),
-        "MLFLOW_KERBEROS_USER": os.environ.get("MLFLOW_KERBEROS_USER"),
-        "MLFLOW_PYARROW_EXTRA_CONF": os.environ.get("MLFLOW_PYARROW_EXTRA_CONF"),
+        "MLFLOW_KERBEROS_TICKET_CACHE": MLFLOW_KERBEROS_TICKET_CACHE.get(),
+        "MLFLOW_KERBEROS_USER": MLFLOW_KERBEROS_USER.get(),
+        "MLFLOW_PYARROW_EXTRA_CONF": MLFLOW_PYARROW_EXTRA_CONF.get(),
     }
-    envs = dict((k, v) for k, v in envs.items() if v is not None)
+    envs = {k: v for k, v in envs.items() if v is not None}
 
     if "MLFLOW_KERBEROS_TICKET_CACHE" in envs:
         ticket_cache = envs["MLFLOW_KERBEROS_TICKET_CACHE"]

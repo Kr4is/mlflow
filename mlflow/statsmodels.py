@@ -18,10 +18,10 @@ import yaml
 
 import mlflow
 from mlflow import pyfunc
-from mlflow.models import Model
+from mlflow.models import Model, ModelInputExample, ModelSignature
 from mlflow.models.model import MLMODEL_FILE_NAME
-from mlflow.models.signature import ModelSignature
-from mlflow.models.utils import ModelInputExample, _save_example
+from mlflow.models.signature import _infer_signature_from_input_example
+from mlflow.models.utils import _save_example
 from mlflow.tracking.artifact_utils import _download_artifact_from_uri
 from mlflow.utils.environment import (
     _mlflow_conda_env,
@@ -31,6 +31,8 @@ from mlflow.utils.environment import (
     _CONDA_ENV_FILE_NAME,
     _REQUIREMENTS_FILE_NAME,
     _CONSTRAINTS_FILE_NAME,
+    _PYTHON_ENV_FILE_NAME,
+    _PythonEnv,
 )
 from mlflow.utils.requirements_utils import _get_pinned_requirement
 from mlflow.utils.file_utils import write_to
@@ -96,6 +98,7 @@ def save_model(
     input_example: ModelInputExample = None,
     pip_requirements=None,
     extra_pip_requirements=None,
+    metadata=None,
 ):
     """
     Save a statsmodels model to a path on the local file system.
@@ -112,27 +115,14 @@ def save_model(
                         If True, then all arrays with length nobs are set to None before
                         pickling. See the remove_data method.
                         In some cases not all arrays will be set to None.
-
-    :param signature: :py:class:`ModelSignature <mlflow.models.ModelSignature>`
-                      describes model input and output :py:class:`Schema <mlflow.types.Schema>`.
-                      The model signature can be :py:func:`inferred <mlflow.models.infer_signature>`
-                      from datasets with valid model input (e.g. the training dataset with target
-                      column omitted) and valid model output (e.g. model predictions generated on
-                      the training dataset), for example:
-
-                      .. code-block:: python
-
-                        from mlflow.models.signature import infer_signature
-                        train = df.drop_column("target_label")
-                        predictions = ... # compute model predictions
-                        signature = infer_signature(train, predictions)
-    :param input_example: Input example provides one or several instances of valid
-                          model input. The example can be used as a hint of what data to feed the
-                          model. The given example will be converted to a Pandas DataFrame and then
-                          serialized to json using the Pandas split-oriented format. Bytes are
-                          base64-encoded.
+    :param signature: {{ signature }}
+    :param input_example: {{ input_example }}
     :param pip_requirements: {{ pip_requirements }}
     :param extra_pip_requirements: {{ extra_pip_requirements }}
+    :param metadata: Custom metadata dictionary passed to the model and stored in the MLmodel file.
+
+                     .. Note:: Experimental: This parameter may change or be removed in a future
+                                             release without warning.
     """
     import statsmodels
 
@@ -143,12 +133,20 @@ def save_model(
     model_data_path = os.path.join(path, STATSMODELS_DATA_SUBPATH)
     code_dir_subpath = _validate_and_copy_code_paths(code_paths, path)
 
+    if signature is None and input_example is not None:
+        wrapped_model = _StatsmodelsModelWrapper(statsmodels_model)
+        signature = _infer_signature_from_input_example(input_example, wrapped_model)
+    elif signature is False:
+        signature = None
+
     if mlflow_model is None:
         mlflow_model = Model()
     if signature is not None:
         mlflow_model.signature = signature
     if input_example is not None:
         _save_example(mlflow_model, input_example, path)
+    if metadata is not None:
+        mlflow_model.metadata = metadata
 
     # Save a statsmodels model
     statsmodels_model.save(model_data_path, remove_data)
@@ -168,7 +166,8 @@ def save_model(
         mlflow_model,
         loader_module="mlflow.statsmodels",
         data=STATSMODELS_DATA_SUBPATH,
-        env=_CONDA_ENV_FILE_NAME,
+        conda_env=_CONDA_ENV_FILE_NAME,
+        python_env=_PYTHON_ENV_FILE_NAME,
         code=code_dir_subpath,
     )
     mlflow_model.add_flavor(
@@ -210,6 +209,8 @@ def save_model(
     # Save `requirements.txt`
     write_to(os.path.join(path, _REQUIREMENTS_FILE_NAME), "\n".join(pip_requirements))
 
+    _PythonEnv.current().to_yaml(os.path.join(path, _PYTHON_ENV_FILE_NAME))
+
 
 @format_docstring(LOG_MODEL_PARAM_DOCS.format(package_name=FLAVOR_NAME))
 def log_model(
@@ -224,6 +225,7 @@ def log_model(
     await_registration_for=DEFAULT_AWAIT_MAX_SLEEP_SECONDS,
     pip_requirements=None,
     extra_pip_requirements=None,
+    metadata=None,
     **kwargs,
 ):
     """
@@ -245,29 +247,17 @@ def log_model(
                         pickling. See the remove_data method.
                         In some cases not all arrays will be set to None.
 
-    :param signature: :py:class:`ModelSignature <mlflow.models.ModelSignature>`
-                      describes model input and output :py:class:`Schema <mlflow.types.Schema>`.
-                      The model signature can be :py:func:`inferred <mlflow.models.infer_signature>`
-                      from datasets with valid model input (e.g. the training dataset with target
-                      column omitted) and valid model output (e.g. model predictions generated on
-                      the training dataset), for example:
-
-                      .. code-block:: python
-
-                        from mlflow.models.signature import infer_signature
-                        train = df.drop_column("target_label")
-                        predictions = ... # compute model predictions
-                        signature = infer_signature(train, predictions)
-    :param input_example: Input example provides one or several instances of valid
-                          model input. The example can be used as a hint of what data to feed the
-                          model. The given example will be converted to a Pandas DataFrame and then
-                          serialized to json using the Pandas split-oriented format. Bytes are
-                          base64-encoded.
+    :param signature: {{ signature }}
+    :param input_example: {{ input_example }}
     :param await_registration_for: Number of seconds to wait for the model version to finish
                             being created and is in ``READY`` status. By default, the function
                             waits for five minutes. Specify 0 or None to skip waiting.
     :param pip_requirements: {{ pip_requirements }}
     :param extra_pip_requirements: {{ extra_pip_requirements }}
+    :param metadata: Custom metadata dictionary passed to the model and stored in the MLmodel file.
+
+                     .. Note:: Experimental: This parameter may change or be removed in a future
+                                             release without warning.
     :return: A :py:class:`ModelInfo <mlflow.models.model.ModelInfo>` instance that contains the
              metadata of the logged model.
     """
@@ -284,6 +274,7 @@ def log_model(
         remove_data=remove_data,
         pip_requirements=pip_requirements,
         extra_pip_requirements=extra_pip_requirements,
+        metadata=metadata,
         **kwargs,
     )
 
@@ -411,6 +402,7 @@ def _get_autolog_metrics(fitted_model):
 @autologging_integration(FLAVOR_NAME)
 def autolog(
     log_models=True,
+    log_datasets=True,
     disable=False,
     exclusive=False,
     disable_for_unsupported_versions=False,
@@ -431,6 +423,8 @@ def autolog(
                        If ``False``, trained models are not logged.
                        Input examples and model signatures, which are attributes of MLflow models,
                        are also omitted when ``log_models`` is ``False``.
+    :param log_datasets: If ``True``, dataset information is logged to MLflow Tracking.
+                         If ``False``, dataset information is not logged.
     :param disable: If ``True``, disables the statsmodels autologging integration. If ``False``,
                     enables the statsmodels autologging integration.
     :param exclusive: If ``True``, autologged content is not logged to user-created fluent runs.
@@ -478,8 +472,8 @@ def autolog(
         """
         try:
             superclass = inspect.getmro(klass)[1]
-            overriden = getattr(klass, function_name) is not getattr(superclass, function_name)
-            return overriden
+            overridden = getattr(klass, function_name) is not getattr(superclass, function_name)
+            return overridden
         except (IndexError, AttributeError):
             return False
 
@@ -512,7 +506,6 @@ def autolog(
             safe_patch(FLAVOR_NAME, clazz, method_name, patch_impl, manage_run=True)
 
     def wrapper_fit(original, self, *args, **kwargs):
-
         should_autolog = False
         if AutologHelpers.should_autolog:
             AutologHelpers.should_autolog = False
@@ -561,6 +554,7 @@ def autolog(
     patch_class_tree(statsmodels.base.model.Model)
 
 
-autolog.__doc__ = autolog.__doc__.format(
-    autolog_metric_allowlist=", ".join(_autolog_metric_allowlist)
-)
+if autolog.__doc__ is not None:
+    autolog.__doc__ = autolog.__doc__.format(
+        autolog_metric_allowlist=", ".join(_autolog_metric_allowlist)
+    )

@@ -40,6 +40,7 @@ extensions = [
     "sphinx.ext.viewcode",
     "sphinx.ext.napoleon",
     "sphinx_click.ext",
+    "test_code_block",
 ]
 
 # Add any paths that contain templates here, relative to this directory.
@@ -124,7 +125,9 @@ todo_include_todos = False
 # The theme to use for HTML and HTML Help pages.  See the documentation for
 # a list of builtin themes.
 
-html_context = {"use_algolia": os.environ.get("USE_ALGOLIA", "0")}
+html_context = {
+    "gtm_id": os.environ.get("GTM_ID", ""),
+}
 
 html_theme_path = ["../theme/"]
 html_theme = "mlflow"
@@ -339,10 +342,13 @@ nitpick_ignore = [
     ("py:class", "mlflow.models.model.Model"),
     ("py:class", "mlflow.models.signature.ModelSignature"),
     ("py:class", "MlflowInferableDataset"),
+    ("py:class", "csr_matrix"),
+    ("py:class", "csc_matrix"),
     ("py:class", "scipy.sparse.csr.csr_matrix"),
     ("py:class", "scipy.sparse.csc.csc_matrix"),
     ("py:class", "scipy.sparse._csr.csr_matrix"),
     ("py:class", "scipy.sparse._csc.csc_matrix"),
+    ("py:class", "pathlib.Path"),
 ]
 
 

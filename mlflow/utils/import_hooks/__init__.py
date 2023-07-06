@@ -13,7 +13,6 @@ It also extends the functionality to support custom hooks for import errors
 
 import sys
 import threading
-
 import importlib  # pylint: disable=unused-import
 
 string_types = (str,)
@@ -39,7 +38,7 @@ def synchronized(lock):
 # The dictionary registering any post import hooks to be triggered once
 # the target module has been imported. Once a module has been imported
 # and the hooks fired, the list of hooks recorded against the target
-# module will be truncacted but the list left in the dictionary. This
+# module will be truncated but the list left in the dictionary. This
 # acts as a flag to indicate that the module had already been imported.
 
 _post_import_hooks = {}
@@ -181,14 +180,21 @@ def _create_import_hook_from_entrypoint(entrypoint):
 
 
 def discover_post_import_hooks(group):
-    try:
-        import pkg_resources
-    except ImportError:
-        return
+    # New in 3.9: https://docs.python.org/3/library/importlib.resources.html#importlib.resources.files
+    if sys.version_info.major > 2 and sys.version_info.minor > 8:
+        from importlib.resources import files  # pylint: disable=lazy-builtin-import
 
-    for entrypoint in pkg_resources.iter_entry_points(group=group):
-        callback = _create_import_hook_from_entrypoint(entrypoint)
-        register_post_import_hook(callback, entrypoint.name)
+        for entrypoint in (
+            resource.name for resource in files(group).iterdir() if resource.is_file()
+        ):
+            callback = _create_import_hook_from_entrypoint(entrypoint)
+            register_post_import_hook(callback, entrypoint.name)
+    else:
+        from importlib.resources import contents  # pylint: disable=lazy-builtin-import
+
+        for entrypoint in contents(group):
+            callback = _create_import_hook_from_entrypoint(entrypoint)
+            register_post_import_hook(callback, entrypoint.name)
 
 
 # Indicate that a module has been loaded. Any post import hooks which
@@ -278,7 +284,7 @@ class ImportHookFinder:
             # real loader to import the module and invoke the
             # post import hooks.
             try:
-                import importlib.util
+                import importlib.util  # pylint: disable=lazy-builtin-import
 
                 loader = importlib.util.find_spec(fullname).loader
             # If an ImportError (or AttributeError) is encountered while finding the module,
@@ -316,7 +322,7 @@ class ImportHookFinder:
         # Now call back into the import system again.
 
         try:
-            import importlib.util
+            import importlib.util  # pylint: disable=lazy-builtin-import
 
             spec = importlib.util.find_spec(fullname)
             # Replace the module spec's loader with a wrapped version that executes import

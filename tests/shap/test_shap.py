@@ -11,6 +11,7 @@ import pandas as pd
 import pytest
 
 import mlflow
+from mlflow import MlflowClient
 
 
 ModelWithExplanation = namedtuple(
@@ -22,7 +23,7 @@ def yield_artifacts(run_id, path=None):
     """
     Yields all artifacts in the specified run.
     """
-    client = mlflow.tracking.MlflowClient()
+    client = MlflowClient()
     for item in client.list_artifacts(run_id, path):
         if item.is_dir:
             yield from yield_artifacts(run_id, item.path)
@@ -67,10 +68,8 @@ def classifier():
     return ModelWithExplanation(model, X, shap_values, explainer.expected_value)
 
 
-@pytest.mark.large
-@pytest.mark.parametrize("np_obj", [np.float(0.0), np.array([0.0])])
+@pytest.mark.parametrize("np_obj", [float(0.0), np.array([0.0])])
 def test_log_numpy(np_obj):
-
     with mlflow.start_run() as run:
         mlflow.shap._log_numpy(np_obj, "test.npy")
         mlflow.shap._log_numpy(np_obj, "test.npy", artifact_path="dir")
@@ -79,9 +78,7 @@ def test_log_numpy(np_obj):
     assert artifacts == {"test.npy", "dir/test.npy"}
 
 
-@pytest.mark.large
 def test_log_matplotlib_figure():
-
     fig, ax = plt.subplots()
     ax.plot([0, 1], [2, 3])
 
@@ -93,7 +90,6 @@ def test_log_matplotlib_figure():
     assert artifacts == {"test.png", "dir/test.png"}
 
 
-@pytest.mark.large
 def test_log_explanation_with_regressor(regressor):
     model = regressor.model
     X = regressor.X
@@ -120,7 +116,6 @@ def test_log_explanation_with_regressor(regressor):
     np.testing.assert_array_equal(base_values, regressor.base_values)
 
 
-@pytest.mark.large
 def test_log_explanation_with_classifier(classifier):
     model = classifier.model
     X = classifier.X
@@ -147,7 +142,6 @@ def test_log_explanation_with_classifier(classifier):
     np.testing.assert_array_equal(base_values, classifier.base_values)
 
 
-@pytest.mark.large
 @pytest.mark.parametrize("artifact_path", ["dir", "dir1/dir2"])
 def test_log_explanation_with_artifact_path(regressor, artifact_path):
     model = regressor.model
@@ -174,16 +168,12 @@ def test_log_explanation_with_artifact_path(regressor, artifact_path):
     np.testing.assert_array_equal(base_values, regressor.base_values)
 
 
-@pytest.mark.large
 def test_log_explanation_without_active_run(regressor):
     model = regressor.model
     X = regressor.X.values
 
-    try:
+    with mlflow.start_run() as run:
         explanation_uri = mlflow.shap.log_explanation(model.predict, X)
-    finally:
-        run = mlflow.active_run()
-        mlflow.end_run()
 
         # Assert no figure is open
         assert len(plt.get_fignums()) == 0
@@ -204,7 +194,6 @@ def test_log_explanation_without_active_run(regressor):
         np.testing.assert_array_equal(base_values, regressor.base_values)
 
 
-@pytest.mark.large
 def test_log_explanation_with_numpy_array(regressor):
     model = regressor.model
     X = regressor.X.values
@@ -231,7 +220,6 @@ def test_log_explanation_with_numpy_array(regressor):
     np.testing.assert_array_equal(base_values, regressor.base_values)
 
 
-@pytest.mark.large
 def test_log_explanation_with_small_features():
     """
     Verifies that `log_explanation` does not fail even when `features` has less records than

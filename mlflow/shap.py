@@ -10,14 +10,12 @@ import mlflow
 import types
 import mlflow.utils.autologging_utils
 from mlflow import pyfunc
-from mlflow.utils.annotations import experimental
 from mlflow.utils.uri import append_to_uri_path
-from mlflow.models import Model
+from mlflow.models import Model, ModelInputExample, ModelSignature
 
 from mlflow.tracking.artifact_utils import _download_artifact_from_uri
 from mlflow.models.model import MLMODEL_FILE_NAME
-from mlflow.models.signature import ModelSignature
-from mlflow.models.utils import ModelInputExample, _save_example
+from mlflow.models.utils import _save_example
 from mlflow.utils.environment import (
     _mlflow_conda_env,
     _get_pip_deps,
@@ -27,6 +25,8 @@ from mlflow.utils.environment import (
     _CONSTRAINTS_FILE_NAME,
     _CONDA_ENV_FILE_NAME,
     _REQUIREMENTS_FILE_NAME,
+    _PYTHON_ENV_FILE_NAME,
+    _PythonEnv,
 )
 from mlflow.utils.requirements_utils import _get_package_name
 from mlflow.utils.file_utils import write_to
@@ -95,7 +95,7 @@ def get_default_pip_requirements():
     """
     import shap
 
-    return ["shap=={}".format(shap.__version__)]
+    return [f"shap=={shap.__version__}"]
 
 
 def get_default_conda_env():
@@ -143,11 +143,10 @@ def _log_matplotlib_figure(fig, out_file, artifact_path=None):
 
 def _get_conda_env_for_underlying_model(underlying_model_path):
     underlying_model_conda_path = os.path.join(underlying_model_path, "conda.yaml")
-    with open(underlying_model_conda_path, "r") as underlying_model_conda_file:
+    with open(underlying_model_conda_path) as underlying_model_conda_file:
         return yaml.safe_load(underlying_model_conda_file)
 
 
-@experimental
 def log_explanation(predict_function, features, artifact_path=None):
     r"""
     Given a ``predict_function`` capable of computing ML model output on the provided ``features``,
@@ -214,6 +213,7 @@ def log_explanation(predict_function, features, artifact_path=None):
         from sklearn.linear_model import LinearRegression
 
         import mlflow
+        from mlflow import MlflowClient
 
         # prepare training data
         X, y = dataset = load_diabetes(return_X_y=True, as_frame=True)
@@ -229,7 +229,7 @@ def log_explanation(predict_function, features, artifact_path=None):
             mlflow.shap.log_explanation(model.predict, X)
 
         # list artifacts
-        client = mlflow.tracking.MlflowClient()
+        client = MlflowClient()
         artifact_path = "model_explanations_shap"
         artifacts = [x.path for x in client.list_artifacts(run.info.run_id, artifact_path)]
         print("# artifacts:")
@@ -286,7 +286,6 @@ def log_explanation(predict_function, features, artifact_path=None):
     return append_to_uri_path(mlflow.active_run().info.artifact_uri, artifact_path)
 
 
-@experimental
 @format_docstring(LOG_MODEL_PARAM_DOCS.format(package_name=FLAVOR_NAME))
 def log_explainer(
     explainer,
@@ -300,6 +299,7 @@ def log_explainer(
     await_registration_for=DEFAULT_AWAIT_MAX_SLEEP_SECONDS,
     pip_requirements=None,
     extra_pip_requirements=None,
+    metadata=None,
 ):
     """
     Log an SHAP explainer as an MLflow artifact for the current run.
@@ -329,9 +329,10 @@ def log_explainer(
 
                       .. code-block:: python
 
-                        from mlflow.models.signature import infer_signature
+                        from mlflow.models import infer_signature
+
                         train = df.drop_column("target_label")
-                        predictions = ... # compute model predictions
+                        predictions = ...  # compute model predictions
                         signature = infer_signature(train, predictions)
     :param input_example: Input example provides one or several instances of valid
                           model input. The example can be used as a hint of what data to feed the
@@ -343,6 +344,10 @@ def log_explainer(
                             waits for five minutes. Specify 0 or None to skip waiting.
     :param pip_requirements: {{ pip_requirements }}
     :param extra_pip_requirements: {{ extra_pip_requirements }}
+    :param metadata: Custom metadata dictionary passed to the model and stored in the MLmodel file.
+
+                     .. Note:: Experimental: This parameter may change or be removed in a future
+                                             release without warning.
     """
 
     Model.log(
@@ -358,10 +363,10 @@ def log_explainer(
         await_registration_for=await_registration_for,
         pip_requirements=pip_requirements,
         extra_pip_requirements=extra_pip_requirements,
+        metadata=metadata,
     )
 
 
-@experimental
 @format_docstring(LOG_MODEL_PARAM_DOCS.format(package_name=FLAVOR_NAME))
 def save_explainer(
     explainer,
@@ -374,6 +379,7 @@ def save_explainer(
     input_example: ModelInputExample = None,
     pip_requirements=None,
     extra_pip_requirements=None,
+    metadata=None,
 ):
     """
     Save a SHAP explainer to a path on the local file system. Produces an MLflow Model
@@ -404,9 +410,10 @@ def save_explainer(
 
                       .. code-block:: python
 
-                        from mlflow.models.signature import infer_signature
+                        from mlflow.models import infer_signature
+
                         train = df.drop_column("target_label")
-                        predictions = ... # compute model predictions
+                        predictions = ...  # compute model predictions
                         signature = infer_signature(train, predictions)
     :param input_example: Input example provides one or several instances of valid
                           model input. The example can be used as a hint of what data to feed the
@@ -415,6 +422,10 @@ def save_explainer(
                           base64-encoded.
     :param pip_requirements: {{ pip_requirements }}
     :param extra_pip_requirements: {{ extra_pip_requirements }}
+    :param metadata: Custom metadata dictionary passed to the model and stored in the MLmodel file.
+
+                     .. Note:: Experimental: This parameter may change or be removed in a future
+                                             release without warning.
     """
     import shap
 
@@ -429,6 +440,8 @@ def save_explainer(
         mlflow_model.signature = signature
     if input_example is not None:
         _save_example(mlflow_model, input_example, path)
+    if metadata is not None:
+        mlflow_model.metadata = metadata
 
     underlying_model_flavor = None
     underlying_model_path = None
@@ -465,7 +478,8 @@ def save_explainer(
         loader_module="mlflow.shap",
         model_path=explainer_data_subpath,
         underlying_model_flavor=underlying_model_flavor,
-        env=_CONDA_ENV_FILE_NAME,
+        conda_env=_CONDA_ENV_FILE_NAME,
+        python_env=_PYTHON_ENV_FILE_NAME,
         code=code_dir_subpath,
     )
 
@@ -514,6 +528,8 @@ def save_explainer(
 
     # Save `requirements.txt`
     write_to(os.path.join(path, _REQUIREMENTS_FILE_NAME), "\n".join(pip_requirements))
+
+    _PythonEnv.current().to_yaml(os.path.join(path, _PYTHON_ENV_FILE_NAME))
 
 
 # Defining save_model (Required by Model.log) to refer to save_explainer
@@ -576,7 +592,6 @@ def _merge_environments(shap_environment, model_environment):
     )
 
 
-@experimental
 def load_explainer(model_uri):
     """
     Load a SHAP explainer from a local file or a run.
@@ -614,7 +629,6 @@ def load_explainer(model_uri):
     return _load_explainer(explainer_file=explainer_artifacts_path, model=model)
 
 
-@experimental
 def _load_explainer(explainer_file, model=None):
     """
     Load a SHAP explainer saved as an MLflow artifact on the local file system.

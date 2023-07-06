@@ -14,7 +14,7 @@ It tackles four primary functions:
 
 MLflow is library-agnostic. You can use it with any machine learning library, and in any
 programming language, since all functions are accessible through a :ref:`rest-api`
-and :ref:`CLI<cli>`. For convenience, the project also includes a :ref:`python-api`, :ref:`R-api`, 
+and :ref:`CLI<cli>`. For convenience, the project also includes a :ref:`python-api`, :ref:`R-api`,
 and :ref:`java_api`.
 
 Get started using the :ref:`quickstart` or by reading about the :ref:`key concepts<concepts>`.
@@ -22,17 +22,26 @@ Get started using the :ref:`quickstart` or by reading about the :ref:`key concep
 .. toctree::
     :maxdepth: 1
 
+    what-is-mlflow
     quickstart
+    quickstart_mlops
     tutorials-and-examples/index
     concepts
     tracking
+    llm-tracking
     projects
     models
     model-registry
+    recipes
     plugins
+    auth/index
     cli
-    search-syntax
+    search-runs
+    search-experiments
     python_api/index
     R-api
     java_api/index
     rest-api
+    docker
+    community-model-flavors
+

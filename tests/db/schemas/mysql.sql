@@ -10,6 +10,8 @@ CREATE TABLE experiments (
 	name VARCHAR(256) NOT NULL,
 	artifact_location VARCHAR(256),
 	lifecycle_stage VARCHAR(32),
+	creation_time BIGINT,
+	last_update_time BIGINT,
 	PRIMARY KEY (experiment_id),
 	CONSTRAINT experiments_lifecycle_stage CHECK ((`lifecycle_stage` in (_utf8mb4'active',_utf8mb4'deleted')))
 )
@@ -74,6 +76,7 @@ CREATE TABLE runs (
 	lifecycle_stage VARCHAR(20),
 	artifact_uri VARCHAR(200),
 	experiment_id INTEGER,
+	deleted_time BIGINT,
 	PRIMARY KEY (run_uuid),
 	CONSTRAINT runs_ibfk_1 FOREIGN KEY(experiment_id) REFERENCES experiments (experiment_id),
 	CONSTRAINT runs_chk_1 CHECK ((`status` in (_utf8mb4'SCHEDULED',_utf8mb4'FAILED',_utf8mb4'FINISHED',_utf8mb4'RUNNING',_utf8mb4'KILLED'))),
@@ -121,7 +124,7 @@ CREATE TABLE model_version_tags (
 
 CREATE TABLE params (
 	key VARCHAR(250) NOT NULL,
-	value VARCHAR(250) NOT NULL,
+	value VARCHAR(500) NOT NULL,
 	run_uuid VARCHAR(32) NOT NULL,
 	PRIMARY KEY (key, run_uuid),
 	CONSTRAINT params_ibfk_1 FOREIGN KEY(run_uuid) REFERENCES runs (run_uuid)
@@ -134,4 +137,13 @@ CREATE TABLE tags (
 	run_uuid VARCHAR(32) NOT NULL,
 	PRIMARY KEY (key, run_uuid),
 	CONSTRAINT tags_ibfk_1 FOREIGN KEY(run_uuid) REFERENCES runs (run_uuid)
+)
+
+
+CREATE TABLE registered_model_aliases (
+	name VARCHAR(256) NOT NULL,
+	alias VARCHAR(256) NOT NULL,
+	version INTEGER NOT NULL,
+	CONSTRAINT registered_model_alias_pk PRIMARY KEY (name, alias),
+	CONSTRAINT registered_model_alias_name_fkey FOREIGN KEY(name) REFERENCES registered_models (name) ON UPDATE CASCADE ON DELETE CASCADE
 )

@@ -1,6 +1,8 @@
 import codecs
 import errno
 import gzip
+import json
+import math
 import os
 import posixpath
 import shutil
@@ -8,11 +10,17 @@ import sys
 import tarfile
 import tempfile
 import stat
+import pathlib
+from concurrent.futures import as_completed
+from contextlib import contextmanager
+import uuid
+import fnmatch
 
 import urllib.parse
 import urllib.request
 from urllib.parse import unquote
 from urllib.request import pathname2url
+
 
 import atexit
 
@@ -25,10 +33,19 @@ except ImportError:
 
 from mlflow.entities import FileInfo
 from mlflow.exceptions import MissingConfigException
-from mlflow.utils.rest_utils import cloud_storage_http_request, augmented_raise_for_status
-from mlflow.utils.process import cache_return_value_per_process
+from mlflow.protos.databricks_artifacts_pb2 import ArtifactCredentialType
+from mlflow.utils.rest_utils import augmented_raise_for_status
+from mlflow.utils.request_utils import cloud_storage_http_request
+from mlflow.utils.process import cache_return_value_per_process, _exec_cmd
+from mlflow.utils import merge_dicts
+from mlflow.utils.databricks_utils import _get_dbutils
+from mlflow.utils.os import is_windows
+from mlflow.utils import download_cloud_file_chunk
+from mlflow.utils.request_utils import download_chunk
+
 
 ENCODING = "utf-8"
+MAX_PARALLEL_DOWNLOAD_WORKERS = os.cpu_count() * 2
 
 
 def is_directory(name):
@@ -144,7 +161,7 @@ def write_yaml(root, file_name, data, overwrite=False, sort_keys=True):
     yaml_file_name = file_path if file_path.endswith(".yaml") else file_path + ".yaml"
 
     if exists(yaml_file_name) and not overwrite:
-        raise Exception("Yaml file '%s' exists as '%s" % (file_path, yaml_file_name))
+        raise Exception(f"Yaml file '{file_path}' exists as '{yaml_file_name}")
 
     try:
         with codecs.open(yaml_file_name, mode="w", encoding=ENCODING) as yaml_file:
@@ -160,6 +177,37 @@ def write_yaml(root, file_name, data, overwrite=False, sort_keys=True):
         raise e
 
 
+def overwrite_yaml(root, file_name, data):
+    """
+    Safely overwrites a preexisting yaml file, ensuring that file contents are not deleted or
+    corrupted if the write fails. This is achieved by writing contents to a temporary file
+    and moving the temporary file to replace the preexisting file, rather than opening the
+    preexisting file for a direct write.
+
+    :param root: Directory name.
+    :param file_name: File name. Expects to have '.yaml' extension.
+    :param data: The data to write, represented as a dictionary.
+    """
+    tmp_file_path = None
+    try:
+        tmp_file_fd, tmp_file_path = tempfile.mkstemp(suffix="file.yaml")
+        os.close(tmp_file_fd)
+        write_yaml(
+            root=get_parent_dir(tmp_file_path),
+            file_name=os.path.basename(tmp_file_path),
+            data=data,
+            overwrite=True,
+            sort_keys=True,
+        )
+        shutil.move(
+            tmp_file_path,
+            os.path.join(root, file_name),
+        )
+    finally:
+        if tmp_file_path is not None and os.path.exists(tmp_file_path):
+            os.remove(tmp_file_path)
+
+
 def read_yaml(root, file_name):
     """
     Read data from yaml file and return as dictionary
@@ -171,7 +219,7 @@ def read_yaml(root, file_name):
     """
     if not exists(root):
         raise MissingConfigException(
-            "Cannot read '%s'. Parent dir '%s' does not exist." % (file_name, root)
+            f"Cannot read '{file_name}'. Parent dir '{root}' does not exist."
         )
 
     file_path = os.path.join(root, file_name)
@@ -182,6 +230,88 @@ def read_yaml(root, file_name):
             return yaml.load(yaml_file, Loader=YamlSafeLoader)
     except Exception as e:
         raise e
+
+
+class UniqueKeyLoader(YamlSafeLoader):
+    def construct_mapping(self, node, deep=False):
+        mapping = set()
+        for key_node, _ in node.value:
+            key = self.construct_object(key_node, deep=deep)
+            if key in mapping:
+                raise ValueError(f"Duplicate '{key}' key found in YAML.")
+            mapping.add(key)
+        return super().construct_mapping(node, deep)
+
+
+def render_and_merge_yaml(root, template_name, context_name):
+    """
+    Renders a Jinja2-templated YAML file based on a YAML context file, merge them, and return
+    result as a dictionary.
+
+    :param root: Root directory of the YAML files
+    :param template_name: Name of the template file
+    :param context_name: Name of the context file
+    :return: Data in yaml file as dictionary
+    """
+    import jinja2
+
+    template_path = os.path.join(root, template_name)
+    context_path = os.path.join(root, context_name)
+
+    for path in (template_path, context_path):
+        if not pathlib.Path(path).is_file():
+            raise MissingConfigException("Yaml file '%s' does not exist." % path)
+
+    j2_env = jinja2.Environment(
+        loader=jinja2.FileSystemLoader(root, encoding=ENCODING),
+        undefined=jinja2.StrictUndefined,
+        line_comment_prefix="#",
+    )
+
+    def from_json(input_var):
+        with open(input_var, encoding="utf-8") as f:
+            return json.load(f)
+
+    j2_env.filters["from_json"] = from_json
+    # Compute final source of context file (e.g. my-profile.yml), applying Jinja filters
+    # like from_json as needed to load context information from files, then load into a dict
+    context_source = j2_env.get_template(context_name).render({})
+    context_dict = yaml.load(context_source, Loader=UniqueKeyLoader) or {}
+
+    # Substitute parameters from context dict into template
+    source = j2_env.get_template(template_name).render(context_dict)
+    rendered_template_dict = yaml.load(source, Loader=UniqueKeyLoader)
+    return merge_dicts(rendered_template_dict, context_dict)
+
+
+def read_parquet_as_pandas_df(data_parquet_path: str):
+    """
+    Deserialize and load the specified parquet file as a Pandas DataFrame.
+
+    :param data_parquet_path: String, path object (implementing os.PathLike[str]),
+    or file-like object implementing a binary read() function. The string
+    could be a URL. Valid URL schemes include http, ftp, s3, gs, and file.
+    For file URLs, a host is expected. A local file could
+    be: file://localhost/path/to/table.parquet. A file URL can also be a path to a
+    directory that contains multiple partitioned parquet files. Pyarrow
+    support paths to directories as well as file URLs. A directory
+    path could be: file://localhost/path/to/tables or s3://bucket/partition_dir.
+    :return: pandas dataframe
+    """
+    import pandas as pd
+
+    return pd.read_parquet(data_parquet_path, engine="pyarrow")
+
+
+def write_pandas_df_as_parquet(df, data_parquet_path: str):
+    """
+    Write a DataFrame to the binary parquet format.
+
+    :param df: pandas data frame.
+    :param data_parquet_path: String, path object (implementing os.PathLike[str]),
+    or file-like object implementing a binary write() function.
+    """
+    df.to_parquet(data_parquet_path, engine="pyarrow")
 
 
 class TempDir:
@@ -265,7 +395,7 @@ def get_relative_path(root_path, target_path):
     :return: Path relative to root_path
     """
     if len(root_path) > len(target_path):
-        raise Exception("Root path '%s' longer than target path '%s'" % (root_path, target_path))
+        raise Exception(f"Root path '{root_path}' longer than target path '{target_path}'")
     common_prefix = os.path.commonprefix([root_path, target_path])
     return os.path.relpath(target_path, common_prefix)
 
@@ -320,12 +450,10 @@ def _copy_project(src_path, dst_path=""):
         docker_ignore = os.path.join(mlflow_root, ".dockerignore")
         patterns = []
         if os.path.exists(docker_ignore):
-            with open(docker_ignore, "r") as f:
+            with open(docker_ignore) as f:
                 patterns = [x.strip() for x in f.readlines()]
 
         def ignore(_, names):
-            import fnmatch
-
             res = set()
             for p in patterns:
                 res.update(set(fnmatch.filter(names, p)))
@@ -356,7 +484,7 @@ def _copy_file_or_tree(src, dst, dst_dir=None):
             os.makedirs(dst_dirpath)
         shutil.copy(src=src, dst=dst_path)
     else:
-        shutil.copytree(src=src, dst=dst_path)
+        shutil.copytree(src=src, dst=dst_path, ignore=shutil.ignore_patterns("__pycache__"))
     return dst_subpath
 
 
@@ -399,11 +527,7 @@ def path_to_local_file_uri(path):
     """
     Convert local filesystem path to local file uri.
     """
-    path = pathname2url(path)
-    if path == posixpath.abspath(path):
-        return "file://{path}".format(path=path)
-    else:
-        return "file:{path}".format(path=path)
+    return pathlib.Path(os.path.abspath(path)).as_uri()
 
 
 def path_to_local_sqlite_uri(path):
@@ -420,7 +544,13 @@ def local_file_uri_to_path(uri):
     Convert URI to local filesystem path.
     No-op if the uri does not have the expected scheme.
     """
-    path = urllib.parse.urlparse(uri).path if uri.startswith("file:") else uri
+    path = uri
+    if uri.startswith("file:"):
+        parsed_path = urllib.parse.urlparse(uri)
+        path = parsed_path.path
+        # Fix for retaining server name in UNC path.
+        if is_windows() and parsed_path.netloc:
+            return urllib.request.url2pathname(rf"\\{parsed_path.netloc}{path}")
     return urllib.request.url2pathname(path)
 
 
@@ -448,7 +578,7 @@ def yield_file_in_chunks(file, chunk_size=100000000):
                 break
 
 
-def download_file_using_http_uri(http_uri, download_path, chunk_size=100000000):
+def download_file_using_http_uri(http_uri, download_path, chunk_size=100000000, headers=None):
     """
     Downloads a file specified using the `http_uri` to a local `download_path`. This function
     uses a `chunk_size` to ensure an OOM error is not raised a large file is downloaded.
@@ -456,13 +586,123 @@ def download_file_using_http_uri(http_uri, download_path, chunk_size=100000000):
     Note : This function is meant to download files using presigned urls from various cloud
             providers.
     """
-    with cloud_storage_http_request("get", http_uri, stream=True) as response:
+    if headers is None:
+        headers = {}
+    with cloud_storage_http_request("get", http_uri, stream=True, headers=headers) as response:
         augmented_raise_for_status(response)
         with open(download_path, "wb") as output_file:
             for chunk in response.iter_content(chunk_size=chunk_size):
                 if not chunk:
                     break
                 output_file.write(chunk)
+
+
+def parallelized_download_file_using_http_uri(
+    thread_pool_executor,
+    http_uri,
+    download_path,
+    file_size,
+    uri_type,
+    chunk_size,
+    env,
+    headers=None,
+):
+    """
+    Downloads a file specified using the `http_uri` to a local `download_path`. This function
+    sends multiple requests in parallel each specifying its own desired byte range as a header,
+    then reconstructs the file from the downloaded chunks. This allows for downloads of large files
+    without OOM risk.
+
+    Note : This function is meant to download files using presigned urls from various cloud
+            providers.
+    Returns a dict of chunk index : exception, if one was thrown for that index.
+    """
+
+    def run_download(range_start, range_end):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            temp_file = os.path.join(tmpdir, "error_messages.txt")
+            download_proc = _exec_cmd(
+                cmd=[
+                    sys.executable,
+                    download_cloud_file_chunk.__file__,
+                    "--range-start",
+                    range_start,
+                    "--range-end",
+                    range_end,
+                    "--headers",
+                    json.dumps(headers or {}),
+                    "--download-path",
+                    download_path,
+                    "--http-uri",
+                    http_uri,
+                    "--temp-file",
+                    temp_file,
+                ],
+                throw_on_error=True,
+                synchronous=False,
+                capture_output=True,
+                stream_output=False,
+                env=env,
+            )
+            _, stderr = download_proc.communicate()
+            if download_proc.returncode != 0:
+                if os.path.exists(temp_file):
+                    with open(temp_file, "r") as f:
+                        file_contents = f.read()
+                        if file_contents:
+                            return json.loads(file_contents)
+                        else:
+                            raise Exception(
+                                "Error from download_cloud_file_chunk not captured, "
+                                f"return code {download_proc.returncode}, stderr {stderr}"
+                            )
+
+    num_requests = int(math.ceil(file_size / float(chunk_size)))
+    # Create file if it doesn't exist or erase the contents if it does. We should do this here
+    # before sending to the workers so they can each individually seek to their respective positions
+    # and write chunks without overwriting.
+    open(download_path, "w").close()
+    starting_index = 0
+    if uri_type == ArtifactCredentialType.GCP_SIGNED_URL or uri_type is None:
+        # GCP files could be transcoded, in which case the range header is ignored.
+        # Test if this is the case by downloading one chunk and seeing if it's larger than the
+        # requested size. If yes, let that be the file; if not, continue downloading more chunks.
+        download_chunk(
+            range_start=0,
+            range_end=chunk_size - 1,
+            headers=headers,
+            download_path=download_path,
+            http_uri=http_uri,
+        )
+        downloaded_size = os.path.getsize(download_path)
+        # If downloaded size was equal to the chunk size it would have been downloaded serially,
+        # so we don't need to consider this here
+        if downloaded_size > chunk_size:
+            return {}
+        else:
+            starting_index = 1
+
+    futures = {}
+    for i in range(starting_index, num_requests):
+        range_start = i * chunk_size
+        range_end = range_start + chunk_size - 1
+        futures[thread_pool_executor.submit(run_download, range_start, range_end)] = i
+
+    failed_downloads = {}
+    for future in as_completed(futures):
+        index = futures[future]
+        try:
+            result = future.result()
+            if result is not None:
+                failed_downloads[index] = result
+
+        except Exception as e:
+            failed_downloads[index] = {
+                "error_status_code": 500,
+                "error_text": repr(e),
+            }
+
+    return failed_downloads
 
 
 def _handle_readonly_on_windows(func, path, exc_info):
@@ -497,12 +737,22 @@ def get_or_create_tmp_dir():
 
     if is_in_databricks_runtime() and get_repl_id() is not None:
         # Note: For python process attached to databricks notebook, atexit does not work.
-        # The /tmp/repl_tmp_data/{repl_id} directory will be removed once databricks notebook
-        # detaches.
-        tmp_dir = os.path.join("/tmp", "repl_tmp_data", get_repl_id())
+        # The directory returned by `dbutils.entry_point.getReplLocalTempDir()`
+        # will be removed once databricks notebook detaches.
+        # The temp directory is designed to be used by all kinds of applications,
+        # so create a child directory "mlflow" for storing mlflow temp data.
+        try:
+            repl_local_tmp_dir = _get_dbutils().entry_point.getReplLocalTempDir()
+        except Exception:
+            repl_local_tmp_dir = os.path.join("/tmp", "repl_tmp_data", get_repl_id())
+
+        tmp_dir = os.path.join(repl_local_tmp_dir, "mlflow")
         os.makedirs(tmp_dir, exist_ok=True)
     else:
         tmp_dir = tempfile.mkdtemp()
+        # mkdtemp creates a directory with permission 0o700
+        # change it to be 0o777 to ensure it can be seen in spark UDF
+        os.chmod(tmp_dir, 0o777)
         atexit.register(shutil.rmtree, tmp_dir, ignore_errors=True)
 
     return tmp_dir
@@ -520,12 +770,120 @@ def get_or_create_nfs_tmp_dir():
 
     if is_in_databricks_runtime() and get_repl_id() is not None:
         # Note: In databricks, atexit hook does not work.
-        # The {nfs_root_dir}/repl_tmp_data/{repl_id} directory will be removed once databricks
-        # notebook detaches.
-        tmp_nfs_dir = os.path.join(nfs_root_dir, "repl_tmp_data", get_repl_id())
+        # The directory returned by `dbutils.entry_point.getReplNFSTempDir()`
+        # will be removed once databricks notebook detaches.
+        # The temp directory is designed to be used by all kinds of applications,
+        # so create a child directory "mlflow" for storing mlflow temp data.
+        try:
+            repl_nfs_tmp_dir = _get_dbutils().entry_point.getReplNFSTempDir()
+        except Exception:
+            repl_nfs_tmp_dir = os.path.join(nfs_root_dir, "repl_tmp_data", get_repl_id())
+
+        tmp_nfs_dir = os.path.join(repl_nfs_tmp_dir, "mlflow")
         os.makedirs(tmp_nfs_dir, exist_ok=True)
     else:
         tmp_nfs_dir = tempfile.mkdtemp(dir=nfs_root_dir)
+        # mkdtemp creates a directory with permission 0o700
+        # change it to be 0o777 to ensure it can be seen in spark UDF
+        os.chmod(tmp_nfs_dir, 0o777)
         atexit.register(shutil.rmtree, tmp_nfs_dir, ignore_errors=True)
 
     return tmp_nfs_dir
+
+
+def write_spark_dataframe_to_parquet_on_local_disk(spark_df, output_path):
+    """
+    Write spark dataframe in parquet format to local disk.
+
+    :param spark_df: Spark dataframe
+    :param output_path: path to write the data to
+    """
+    from mlflow.utils.databricks_utils import is_in_databricks_runtime
+
+    if is_in_databricks_runtime():
+        dbfs_path = os.path.join(".mlflow", "cache", str(uuid.uuid4()))
+        spark_df.coalesce(1).write.format("parquet").save(dbfs_path)
+        shutil.copytree("/dbfs/" + dbfs_path, output_path)
+        shutil.rmtree("/dbfs/" + dbfs_path)
+    else:
+        spark_df.coalesce(1).write.format("parquet").save(output_path)
+
+
+def shutil_copytree_without_file_permissions(src_dir, dst_dir):
+    """
+    Copies the directory src_dir into dst_dir, without preserving filesystem permissions
+    """
+    for dirpath, dirnames, filenames in os.walk(src_dir):
+        for dirname in dirnames:
+            relative_dir_path = os.path.relpath(os.path.join(dirpath, dirname), src_dir)
+            # For each directory <dirname> immediately under <dirpath>, create an equivalently-named
+            # directory under the destination directory
+            abs_dir_path = os.path.join(dst_dir, relative_dir_path)
+            os.mkdir(abs_dir_path)
+        for filename in filenames:
+            # For each file with name <filename> immediately under <dirpath>, copy that file to
+            # the appropriate location in the destination directory
+            file_path = os.path.join(dirpath, filename)
+            relative_file_path = os.path.relpath(file_path, src_dir)
+            abs_file_path = os.path.join(dst_dir, relative_file_path)
+            shutil.copyfile(file_path, abs_file_path)
+
+
+def contains_path_separator(path):
+    """
+    Returns True if a path contains a path separator, False otherwise.
+    """
+    return any((sep in path) for sep in (os.path.sep, os.path.altsep) if sep is not None)
+
+
+def read_chunk(path: os.PathLike, size: int, start_byte: int = 0) -> bytes:
+    """
+    Read a chunk of bytes from a file.
+
+    :param path: Path to the file.
+    :param size: The size of the chunk.
+    :param start_byte: The start byte of the chunk.
+    :return: The chunk of bytes.
+    """
+    with open(path, "rb") as f:
+        if start_byte > 0:
+            f.seek(start_byte)
+        return f.read(size)
+
+
+@contextmanager
+def remove_on_error(path: os.PathLike, onerror=None):
+    """
+    A context manager that removes a file or directory if an exception is raised during execution.
+
+    :param path: Path to the file or directory.
+    :param onerror: A callback function that will be called with the captured exception before
+                    the file or directory is removed. For example, you can use this callback to
+                    log the exception.
+    """
+    try:
+        yield
+    except Exception as e:
+        if onerror:
+            onerror(e)
+        if os.path.exists(path):
+            if os.path.isfile(path):
+                os.remove(path)
+            elif os.path.isdir(path):
+                shutil.rmtree(path)
+        raise
+
+
+@contextmanager
+def chdir(path: str) -> None:
+    """
+    Temporarily change the current working directory to the specified path.
+
+    :param path: The path to use as the temporary working directory.
+    """
+    cwd = os.getcwd()
+    try:
+        os.chdir(path)
+        yield
+    finally:
+        os.chdir(cwd)

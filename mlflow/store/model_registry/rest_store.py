@@ -6,7 +6,6 @@ from mlflow.protos.model_registry_pb2 import (
     CreateRegisteredModel,
     UpdateRegisteredModel,
     DeleteRegisteredModel,
-    ListRegisteredModels,
     GetLatestVersions,
     CreateModelVersion,
     UpdateModelVersion,
@@ -22,13 +21,14 @@ from mlflow.protos.model_registry_pb2 import (
     SetModelVersionTag,
     DeleteRegisteredModelTag,
     DeleteModelVersionTag,
+    SetRegisteredModelAlias,
+    DeleteRegisteredModelAlias,
+    GetModelVersionByAlias,
 )
 from mlflow.store.entities.paged_list import PagedList
-from mlflow.store.model_registry.abstract_store import AbstractStore
+from mlflow.store.model_registry.base_rest_store import BaseRestStore
 from mlflow.utils.proto_json_utils import message_to_json
 from mlflow.utils.rest_utils import (
-    call_endpoint,
-    call_endpoints,
     extract_api_info_for_service,
     extract_all_api_info_for_service,
     _REST_API_PATH_PREFIX,
@@ -40,9 +40,8 @@ _METHOD_TO_ALL_INFO = extract_all_api_info_for_service(ModelRegistryService, _RE
 _logger = logging.getLogger(__name__)
 
 
-class RestStore(AbstractStore):
+class RestStore(BaseRestStore):
     """
-    Note:: Experimental: This entity may change or be removed in a future release without warning.
     Client for a remote model registry server accessed via REST API calls
 
     :param get_host_creds: Method to be invoked prior to every REST request to get the
@@ -50,18 +49,14 @@ class RestStore(AbstractStore):
       is a function so that we can obtain fresh credentials in the case of expiry.
     """
 
-    def __init__(self, get_host_creds):
-        super().__init__()
-        self.get_host_creds = get_host_creds
+    def _get_response_from_method(self, method):
+        return method.Response()
 
-    def _call_endpoint(self, api, json_body, call_all_endpoints=False):
-        response_proto = api.Response()
-        if call_all_endpoints:
-            endpoints = _METHOD_TO_ALL_INFO[api]
-            return call_endpoints(self.get_host_creds(), endpoints, json_body, response_proto)
-        else:
-            endpoint, method = _METHOD_TO_INFO[api]
-            return call_endpoint(self.get_host_creds(), endpoint, method, json_body, response_proto)
+    def _get_endpoint_from_method(self, method):
+        return _METHOD_TO_INFO[method]
+
+    def _get_all_endpoints_from_method(self, method):
+        return _METHOD_TO_ALL_INFO[method]
 
     # CRUD API for RegisteredModel objects
 
@@ -117,29 +112,6 @@ class RestStore(AbstractStore):
         """
         req_body = message_to_json(DeleteRegisteredModel(name=name))
         self._call_endpoint(DeleteRegisteredModel, req_body)
-
-    def list_registered_models(self, max_results, page_token):
-        """
-        List of all registered models.
-
-        :param max_results: Maximum number of registered models desired.
-        :param page_token: Token specifying the next page of results. It should be obtained from
-                            a ``list_registered_models`` call.
-        :return: A PagedList of :py:class:`mlflow.entities.model_registry.RegisteredModel` objects
-                that satisfy the search expressions. The pagination token for the next page can be
-                obtained via the ``token`` attribute of the object.
-        """
-        req_body = message_to_json(
-            ListRegisteredModels(page_token=page_token, max_results=max_results)
-        )
-        response_proto = self._call_endpoint(ListRegisteredModels, req_body)
-        return PagedList(
-            [
-                RegisteredModel.from_proto(registered_model)
-                for registered_model in response_proto.registered_models
-            ],
-            response_proto.next_page_token,
-        )
 
     def search_registered_models(
         self, filter_string=None, max_results=None, order_by=None, page_token=None
@@ -260,9 +232,9 @@ class RestStore(AbstractStore):
 
         :param name: Registered model name.
         :param version: Registered model version.
-        :param new_stage: New desired stage for this model version.
+        :param stage: New desired stage for this model version.
         :param archive_existing_versions: If this flag is set to ``True``, all existing model
-            versions in the stage will be automically moved to the "archived" stage. Only valid
+            versions in the stage will be automatically moved to the "archived" stage. Only valid
             when ``stage`` is ``"staging"`` or ``"production"`` otherwise an error will be raised.
 
         :return: A single :py:class:`mlflow.entities.model_registry.ModelVersion` object.
@@ -330,17 +302,32 @@ class RestStore(AbstractStore):
         response_proto = self._call_endpoint(GetModelVersionDownloadUri, req_body)
         return response_proto.artifact_uri
 
-    def search_model_versions(self, filter_string):
+    def search_model_versions(
+        self, filter_string=None, max_results=None, order_by=None, page_token=None
+    ):
         """
         Search for model versions in backend that satisfy the filter criteria.
 
         :param filter_string: A filter string expression. Currently supports a single filter
                               condition either name of model like ``name = 'model_name'`` or
                               ``run_id = '...'``.
-        :return: PagedList of :py:class:`mlflow.entities.model_registry.ModelVersion`
-                 objects.
+        :param max_results: Maximum number of model versions desired.
+        :param order_by: List of column names with ASC|DESC annotation, to be used for ordering
+                         matching search results.
+        :param page_token: Token specifying the next page of results. It should be obtained from
+                            a ``search_model_versions`` call.
+        :return: A PagedList of :py:class:`mlflow.entities.model_registry.ModelVersion`
+                 objects that satisfy the search expressions. The pagination token for the next
+                 page can be obtained via the ``token`` attribute of the object.
         """
-        req_body = message_to_json(SearchModelVersions(filter=filter_string))
+        req_body = message_to_json(
+            SearchModelVersions(
+                filter=filter_string,
+                max_results=max_results,
+                order_by=order_by,
+                page_token=page_token,
+            )
+        )
         response_proto = self._call_endpoint(SearchModelVersions, req_body)
         model_versions = [ModelVersion.from_proto(mvd) for mvd in response_proto.model_versions]
         return PagedList(model_versions, response_proto.next_page_token)
@@ -370,3 +357,38 @@ class RestStore(AbstractStore):
         """
         req_body = message_to_json(DeleteModelVersionTag(name=name, version=version, key=key))
         self._call_endpoint(DeleteModelVersionTag, req_body)
+
+    def set_registered_model_alias(self, name, alias, version):
+        """
+        Set a registered model alias pointing to a model version.
+
+        :param name: Registered model name.
+        :param alias: Name of the alias.
+        :param version: Registered model version number.
+        :return: None
+        """
+        req_body = message_to_json(SetRegisteredModelAlias(name=name, alias=alias, version=version))
+        self._call_endpoint(SetRegisteredModelAlias, req_body)
+
+    def delete_registered_model_alias(self, name, alias):
+        """
+        Delete an alias associated with a registered model.
+
+        :param name: Registered model name.
+        :param alias: Name of the alias.
+        :return: None
+        """
+        req_body = message_to_json(DeleteRegisteredModelAlias(name=name, alias=alias))
+        self._call_endpoint(DeleteRegisteredModelAlias, req_body)
+
+    def get_model_version_by_alias(self, name, alias):
+        """
+        Get the model version instance by name and alias.
+
+        :param name: Registered model name.
+        :param alias: Name of the alias.
+        :return: A single :py:class:`mlflow.entities.model_registry.ModelVersion` object.
+        """
+        req_body = message_to_json(GetModelVersionByAlias(name=name, alias=alias))
+        response_proto = self._call_endpoint(GetModelVersionByAlias, req_body)
+        return ModelVersion.from_proto(response_proto.model_version)

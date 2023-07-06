@@ -1,23 +1,14 @@
 import os
 import posixpath
 import pytest
+import shutil
+import json
+import subprocess
+
+from mlflow.environment_variables import _MLFLOW_TESTING
 
 
 def pytest_addoption(parser):
-    parser.addoption(
-        "--large-only",
-        action="store_true",
-        dest="large_only",
-        default=False,
-        help="Run only tests decorated with 'large' annotation",
-    )
-    parser.addoption(
-        "--large",
-        action="store_true",
-        dest="large",
-        default=False,
-        help="Run tests decorated with 'large' annotation",
-    )
     parser.addoption(
         "--requires-ssh",
         action="store_true",
@@ -34,42 +25,19 @@ def pytest_addoption(parser):
         default=False,
         help="Ignore tests for model flavors.",
     )
-    parser.addoption(
-        "--lazy-import",
-        action="store_true",
-        dest="lazy_import",
-        default=False,
-        help=(
-            "Special flag that should be enabled when running "
-            "tests/test_mlflow_lazily_imports_ml_packages.py"
-        ),
-    )
 
 
 def pytest_configure(config):
     # Register markers to suppress `PytestUnknownMarkWarning`
-    config.addinivalue_line("markers", "large")
     config.addinivalue_line("markers", "requires_ssh")
-    config.addinivalue_line("markers", "lazy_import")
     config.addinivalue_line("markers", "notrackingurimock")
     config.addinivalue_line("markers", "allow_infer_pip_requirements_fallback")
 
 
 def pytest_runtest_setup(item):
     markers = [mark.name for mark in item.iter_markers()]
-    marked_as_large = "large" in markers
-    large_option = item.config.getoption("--large")
-    large_only_option = item.config.getoption("--large-only")
-    if marked_as_large and not (large_option or large_only_option):
-        pytest.skip("use `--large` or `--large-only` to run this test")
-    if not marked_as_large and large_only_option:
-        pytest.skip("remove `--large-only` to run this test")
-
     if "requires_ssh" in markers and not item.config.getoption("--requires-ssh"):
         pytest.skip("use `--requires-ssh` to run this test")
-
-    if "lazy_import" in markers and not item.config.getoption("--lazy-import"):
-        pytest.skip("use `--lazy-import` to run this test")
 
 
 @pytest.hookimpl(hookwrapper=True)
@@ -104,6 +72,12 @@ def pytest_ignore_collect(path, config):
             "tests/prophet",
             "tests/pmdarima",
             "tests/diviner",
+            "tests/transformers",
+            "tests/sentence_transformers",
+            "tests/openai",
+            "tests/langchain",
+            "tests/johnsnowlabs",
+            "tests/test_mlflow_lazily_imports_ml_packages.py",
             "tests/utils/test_model_utils.py",
             # this test is included here because it imports many big libraries like tf, keras, etc
             "tests/tracking/fluent/test_fluent_autolog.py",
@@ -113,6 +87,9 @@ def pytest_ignore_collect(path, config):
             "tests/autologging/test_autologging_behaviors_integration.py",
             "tests/autologging/test_autologging_utils.py",
             "tests/autologging/test_training_session.py",
+            # opt in authentication feature
+            "tests/server/auth",
+            "tests/gateway",
         ]
 
         relpath = os.path.relpath(str(path))
@@ -120,3 +97,52 @@ def pytest_ignore_collect(path, config):
 
         if relpath in model_flavors:
             outcome.force_result(True)
+
+
+def pytest_collection_modifyitems(session, config, items):  # pylint: disable=unused-argument
+    # Executing `tests.server.test_prometheus_exporter` after `tests.server.test_handlers`
+    # results in an error because Flask >= 2.2.0 doesn't allow calling setup method such as
+    # `before_request` on the application after the first request. To avoid this issue,
+    # execute `tests.server.test_prometheus_exporter` first by reordering the test items.
+    items.sort(key=lambda item: item.module.__name__ != "tests.server.test_prometheus_exporter")
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_terminal_summary(
+    terminalreporter, exitstatus, config
+):  # pylint: disable=unused-argument
+    yield
+    failed_test_reports = terminalreporter.stats.get("failed", [])
+    if failed_test_reports:
+        if len(failed_test_reports) <= 30:
+            terminalreporter.section("command to run failed test cases")
+            ids = [repr(report.nodeid) for report in failed_test_reports]
+        else:
+            terminalreporter.section("command to run failed test suites")
+            # Use dict.fromkeys to preserve the order
+            ids = list(dict.fromkeys(report.fspath for report in failed_test_reports))
+        terminalreporter.write(" ".join(["pytest"] + ids))
+        terminalreporter.write("\n" * 2)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def clean_up_envs():
+    yield
+
+    if "GITHUB_ACTIONS" in os.environ:
+        from mlflow.utils.virtualenv import _get_mlflow_virtualenv_root
+
+        shutil.rmtree(_get_mlflow_virtualenv_root(), ignore_errors=True)
+        if os.name != "nt":
+            conda_info = json.loads(subprocess.check_output(["conda", "info", "--json"], text=True))
+            root_prefix = conda_info["root_prefix"]
+            for env in conda_info["envs"]:
+                if env != root_prefix:
+                    shutil.rmtree(env, ignore_errors=True)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def enable_mlflow_testing():
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv(_MLFLOW_TESTING.name, "TRUE")
+        yield

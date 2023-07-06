@@ -1,5 +1,4 @@
 import matplotlib.pyplot as plt
-
 import numpy as np
 
 
@@ -75,6 +74,7 @@ def plot_lift_curve(
     figsize=None,
     title_fontsize="large",
     text_fontsize="medium",
+    pos_label=None,
 ):
     """
     This method is copied from scikit-plot package.
@@ -112,6 +112,8 @@ def plot_lift_curve(
             Use e.g. "small", "medium", "large" or integer-values. Defaults to
             "medium".
 
+        pos_label (optional): Label for the positive class.
+
     Returns:
         ax (:class:`matplotlib.axes.Axes`): The axes on which the plot was
             drawn.
@@ -133,9 +135,7 @@ def plot_lift_curve(
 
     classes = np.unique(y_true)
     if len(classes) != 2:
-        raise ValueError(
-            "Cannot calculate Lift Curve for data with {} category/ies".format(len(classes))
-        )
+        raise ValueError(f"Cannot calculate Lift Curve for data with {len(classes)} category/ies")
 
     # Compute Cumulative Gain Curves
     percentages, gains1 = _cumulative_gain_curve(y_true, y_probas[:, 0], classes[0])
@@ -153,8 +153,18 @@ def plot_lift_curve(
 
     ax.set_title(title, fontsize=title_fontsize)
 
-    ax.plot(percentages, gains1, lw=3, label="Class {}".format(classes[0]))
-    ax.plot(percentages, gains2, lw=3, label="Class {}".format(classes[1]))
+    label0 = f"Class {classes[0]}"
+    label1 = f"Class {classes[1]}"
+    # show (positive) next to the positive class in the legend
+    if pos_label:
+        if pos_label == classes[0]:
+            label0 = f"Class {classes[0]} (positive)"
+        elif pos_label == classes[1]:
+            label1 = f"Class {classes[1]} (positive)"
+        # do not mark positive class if pos_label is not in classes
+
+    ax.plot(percentages, gains1, lw=3, label=label0)
+    ax.plot(percentages, gains2, lw=3, label=label1)
 
     ax.plot([0, 1], [1, 1], "k--", lw=2, label="Baseline")
 

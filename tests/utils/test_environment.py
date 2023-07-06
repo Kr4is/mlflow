@@ -14,12 +14,14 @@ from mlflow.utils.environment import (
     _process_pip_requirements,
     _process_conda_env,
     _get_pip_requirement_specifier,
+    _find_duplicate_requirements,
 )
+from tests.helper_functions import _mlflow_major_version_string
 
 
 @pytest.fixture
-def conda_env_path(tmpdir):
-    return os.path.join(tmpdir.strpath, "conda_env.yaml")
+def conda_env_path(tmp_path):
+    return os.path.join(tmp_path, "conda_env.yaml")
 
 
 def test_mlflow_conda_env_returns_none_when_output_path_is_specified(conda_env_path):
@@ -90,7 +92,7 @@ def test_overwrite_pip_deps():
     assert _overwrite_pip_deps(conda_env, ["scipy"]) == expected
 
 
-def test_parse_pip_requirements(tmpdir):
+def test_parse_pip_requirements(tmp_path):
     assert _parse_pip_requirements(None) == ([], [])
     assert _parse_pip_requirements([]) == ([], [])
     # Without version specifiers
@@ -106,54 +108,51 @@ def test_parse_pip_requirements(tmpdir):
     mlflow_repo_uri = "git+https://github.com/mlflow/mlflow.git"
     assert _parse_pip_requirements([mlflow_repo_uri]) == ([mlflow_repo_uri], [])
     # Local file
-    fake_whl = tmpdir.join("fake.whl")
-    fake_whl.write("")
-    assert _parse_pip_requirements([fake_whl.strpath]) == ([fake_whl.strpath], [])
+    fake_whl = tmp_path.joinpath("fake.whl")
+    fake_whl.write_text("")
+    assert _parse_pip_requirements([str(fake_whl)]) == ([str(fake_whl)], [])
 
 
-def test_parse_pip_requirements_with_relative_requirements_files(request, tmpdir):
-    try:
-        os.chdir(tmpdir)
-        f1 = tmpdir.join("requirements1.txt")
-        f1.write("b")
-        assert _parse_pip_requirements(f1.basename) == (["b"], [])
-        assert _parse_pip_requirements(["a", f"-r {f1.basename}"]) == (["a", "b"], [])
+def test_parse_pip_requirements_with_relative_requirements_files(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    f1 = tmp_path.joinpath("requirements1.txt")
+    f1.write_text("b")
+    assert _parse_pip_requirements(f1.name) == (["b"], [])
+    assert _parse_pip_requirements(["a", f"-r {f1.name}"]) == (["a", "b"], [])
 
-        f2 = tmpdir.join("requirements2.txt")
-        f3 = tmpdir.join("requirements3.txt")
-        f2.write(f"b\n-r {f3.basename}")
-        f3.write("c")
-        assert _parse_pip_requirements(f2.basename) == (["b", "c"], [])
-        assert _parse_pip_requirements(["a", f"-r {f2.basename}"]) == (["a", "b", "c"], [])
-    finally:
-        os.chdir(request.config.invocation_dir)
+    f2 = tmp_path.joinpath("requirements2.txt")
+    f3 = tmp_path.joinpath("requirements3.txt")
+    f2.write_text(f"b\n-r {f3.name}")
+    f3.write_text("c")
+    assert _parse_pip_requirements(f2.name) == (["b", "c"], [])
+    assert _parse_pip_requirements(["a", f"-r {f2.name}"]) == (["a", "b", "c"], [])
 
 
-def test_parse_pip_requirements_with_absolute_requirements_files(tmpdir):
-    f1 = tmpdir.join("requirements1.txt")
-    f1.write("b")
-    assert _parse_pip_requirements(f1.strpath) == (["b"], [])
-    assert _parse_pip_requirements(["a", f"-r {f1.strpath}"]) == (["a", "b"], [])
+def test_parse_pip_requirements_with_absolute_requirements_files(tmp_path):
+    f1 = tmp_path.joinpath("requirements1.txt")
+    f1.write_text("b")
+    assert _parse_pip_requirements(str(f1)) == (["b"], [])
+    assert _parse_pip_requirements(["a", f"-r {f1}"]) == (["a", "b"], [])
 
-    f2 = tmpdir.join("requirements2.txt")
-    f3 = tmpdir.join("requirements3.txt")
-    f2.write(f"b\n-r {f3.strpath}")
-    f3.write("c")
-    assert _parse_pip_requirements(f2.strpath) == (["b", "c"], [])
-    assert _parse_pip_requirements(["a", f"-r {f2.strpath}"]) == (["a", "b", "c"], [])
-
-
-def test_parse_pip_requirements_with_constraints_files(tmpdir):
-    con_file = tmpdir.join("constraints.txt")
-    con_file.write("b")
-    assert _parse_pip_requirements(["a", f"-c {con_file.strpath}"]) == (["a"], ["b"])
-
-    req_file = tmpdir.join("requirements.txt")
-    req_file.write(f"-c {con_file.strpath}\n")
-    assert _parse_pip_requirements(["a", f"-r {req_file.strpath}"]) == (["a"], ["b"])
+    f2 = tmp_path.joinpath("requirements2.txt")
+    f3 = tmp_path.joinpath("requirements3.txt")
+    f2.write_text(f"b\n-r {f3}")
+    f3.write_text("c")
+    assert _parse_pip_requirements(str(f2)) == (["b", "c"], [])
+    assert _parse_pip_requirements(["a", f"-r {f2}"]) == (["a", "b", "c"], [])
 
 
-def test_parse_pip_requirements_ignores_comments_and_blank_lines(tmpdir):
+def test_parse_pip_requirements_with_constraints_files(tmp_path):
+    con_file = tmp_path.joinpath("constraints.txt")
+    con_file.write_text("b")
+    assert _parse_pip_requirements(["a", f"-c {con_file}"]) == (["a"], ["b"])
+
+    req_file = tmp_path.joinpath("requirements.txt")
+    req_file.write_text(f"-c {con_file}\n")
+    assert _parse_pip_requirements(["a", f"-r {req_file}"]) == (["a"], ["b"])
+
+
+def test_parse_pip_requirements_ignores_comments_and_blank_lines(tmp_path):
     reqs = [
         "# comment",
         "a # inline comment",
@@ -161,10 +160,10 @@ def test_parse_pip_requirements_ignores_comments_and_blank_lines(tmpdir):
         "",
         " ",
     ]
-    f = tmpdir.join("requirements.txt")
-    f.write("\n".join(reqs))
+    f = tmp_path.joinpath("requirements.txt")
+    f.write_text("\n".join(reqs))
     assert _parse_pip_requirements(reqs) == (["a"], [])
-    assert _parse_pip_requirements(f.strpath) == (["a"], [])
+    assert _parse_pip_requirements(str(f)) == (["a"], [])
 
 
 def test_parse_pip_requirements_removes_temporary_requirements_file():
@@ -209,6 +208,7 @@ def test_is_mlflow_requirement():
     assert _is_mlflow_requirement("mlflow; python_version < '3.8'")
     assert _is_mlflow_requirement("mlflow @ https://github.com/mlflow/mlflow.git")
     assert _is_mlflow_requirement("mlflow @ file:///path/to/mlflow")
+    assert _is_mlflow_requirement("mlflow-skinny==1.2.3")
     assert not _is_mlflow_requirement("foo")
     # Ensure packages that look like mlflow are NOT considered as mlflow.
     assert not _is_mlflow_requirement("mlflow-foo")
@@ -219,6 +219,7 @@ def test_contains_mlflow_requirement():
     assert _contains_mlflow_requirement(["mlflow"])
     assert _contains_mlflow_requirement(["mlflow==1.2.3"])
     assert _contains_mlflow_requirement(["mlflow", "foo"])
+    assert _contains_mlflow_requirement(["mlflow-skinny"])
     assert not _contains_mlflow_requirement([])
     assert not _contains_mlflow_requirement(["foo"])
 
@@ -232,17 +233,19 @@ def test_get_pip_requirement_specifier():
     assert _get_pip_requirement_specifier("  -r reqs.txt") == " "
     assert _get_pip_requirement_specifier("mlflow==1.2.3 --hash=foo") == "mlflow==1.2.3"
     assert _get_pip_requirement_specifier("mlflow==1.2.3       --hash=foo") == "mlflow==1.2.3      "
+    assert _get_pip_requirement_specifier("mlflow-skinny==1.2 --foo=bar") == "mlflow-skinny==1.2"
 
 
-def test_process_pip_requirements(tmpdir):
+def test_process_pip_requirements(tmp_path):
+    expected_mlflow_ver = _mlflow_major_version_string()
     conda_env, reqs, cons = _process_pip_requirements(["a"])
-    assert _get_pip_deps(conda_env) == ["mlflow", "a"]
-    assert reqs == ["mlflow", "a"]
+    assert _get_pip_deps(conda_env) == [expected_mlflow_ver, "a"]
+    assert reqs == [expected_mlflow_ver, "a"]
     assert cons == []
 
     conda_env, reqs, cons = _process_pip_requirements(["a"], pip_requirements=["b"])
-    assert _get_pip_deps(conda_env) == ["mlflow", "b"]
-    assert reqs == ["mlflow", "b"]
+    assert _get_pip_deps(conda_env) == [expected_mlflow_ver, "b"]
+    assert reqs == [expected_mlflow_ver, "b"]
     assert cons == []
 
     # Ensure a requirement for mlflow is preserved
@@ -263,38 +266,40 @@ def test_process_pip_requirements(tmpdir):
     assert cons == []
 
     conda_env, reqs, cons = _process_pip_requirements(["a"], extra_pip_requirements=["b"])
-    assert _get_pip_deps(conda_env) == ["mlflow", "a", "b"]
-    assert reqs == ["mlflow", "a", "b"]
+    assert _get_pip_deps(conda_env) == [expected_mlflow_ver, "a", "b"]
+    assert reqs == [expected_mlflow_ver, "a", "b"]
     assert cons == []
 
-    con_file = tmpdir.join("constraints.txt")
-    con_file.write("c")
+    con_file = tmp_path.joinpath("constraints.txt")
+    con_file.write_text("c")
     conda_env, reqs, cons = _process_pip_requirements(
-        ["a"], pip_requirements=["b", f"-c {con_file.strpath}"]
+        ["a"], pip_requirements=["b", f"-c {con_file}"]
     )
-    assert _get_pip_deps(conda_env) == ["mlflow", "b", "-c constraints.txt"]
-    assert reqs == ["mlflow", "b", "-c constraints.txt"]
+    assert _get_pip_deps(conda_env) == [expected_mlflow_ver, "b", "-c constraints.txt"]
+    assert reqs == [expected_mlflow_ver, "b", "-c constraints.txt"]
     assert cons == ["c"]
 
 
-def test_process_conda_env(tmpdir):
+def test_process_conda_env(tmp_path):
     def make_conda_env(pip_deps):
         return {
             "name": "mlflow-env",
             "channels": ["conda-forge"],
-            "dependencies": ["python=3.7.9", "pip", {"pip": pip_deps}],
+            "dependencies": ["python=3.8.15", "pip", {"pip": pip_deps}],
         }
 
+    expected_mlflow_ver = _mlflow_major_version_string()
+
     conda_env, reqs, cons = _process_conda_env(make_conda_env(["a"]))
-    assert _get_pip_deps(conda_env) == ["mlflow", "a"]
-    assert reqs == ["mlflow", "a"]
+    assert _get_pip_deps(conda_env) == [expected_mlflow_ver, "a"]
+    assert reqs == [expected_mlflow_ver, "a"]
     assert cons == []
 
-    conda_env_file = tmpdir.join("conda_env.yaml")
-    conda_env_file.write(yaml.dump(make_conda_env(["a"])))
-    conda_env, reqs, cons = _process_conda_env(conda_env_file.strpath)
-    assert _get_pip_deps(conda_env) == ["mlflow", "a"]
-    assert reqs == ["mlflow", "a"]
+    conda_env_file = tmp_path.joinpath("conda_env.yaml")
+    conda_env_file.write_text(yaml.dump(make_conda_env(["a"])))
+    conda_env, reqs, cons = _process_conda_env(str(conda_env_file))
+    assert _get_pip_deps(conda_env) == [expected_mlflow_ver, "a"]
+    assert reqs == [expected_mlflow_ver, "a"]
     assert cons == []
 
     # Ensure a requirement for mlflow is preserved
@@ -303,12 +308,47 @@ def test_process_conda_env(tmpdir):
     assert reqs == ["mlflow==1.2.3"]
     assert cons == []
 
-    con_file = tmpdir.join("constraints.txt")
-    con_file.write("c")
-    conda_env, reqs, cons = _process_conda_env(make_conda_env(["a", f"-c {con_file.strpath}"]))
-    assert _get_pip_deps(conda_env) == ["mlflow", "a", "-c constraints.txt"]
-    assert reqs == ["mlflow", "a", "-c constraints.txt"]
+    con_file = tmp_path.joinpath("constraints.txt")
+    con_file.write_text("c")
+    conda_env, reqs, cons = _process_conda_env(make_conda_env(["a", f"-c {con_file}"]))
+    assert _get_pip_deps(conda_env) == [expected_mlflow_ver, "a", "-c constraints.txt"]
+    assert reqs == [expected_mlflow_ver, "a", "-c constraints.txt"]
     assert cons == ["c"]
+
+    # NB: mlflow-skinny is not automatically attached to any model. If specified, it is
+    # up to the user to pin a version.
+    conda_env, reqs, cons = _process_conda_env(make_conda_env(["mlflow-skinny", "a", "b"]))
+    assert _get_pip_deps(conda_env) == ["mlflow-skinny", "a", "b"]
+    assert reqs == ["mlflow-skinny", "a", "b"]
+    assert cons == []
 
     with pytest.raises(TypeError, match=r"Expected .+, but got `int`"):
         _process_conda_env(0)
+
+
+def test_duplicate_pip_requirements():
+    packages = [
+        "numpy==1.21.0",  # specific version
+        "pandas>=1.3.0",  # minimum version
+        "scikit-learn",  # any version
+        "matplotlib<=3.4.2",  # maximum version
+        "seaborn",  # any version
+        "package!=1.2.3",  # any version but this one
+        "package~=1.2.3",  # compatible version (i.e., >= 1.2.3, == 1.2.*)
+        "package>1.2.3",  # version greater than
+        "package<1.2.3",  # version less than
+        "package[extra]==1.2.3",  # specific version with extras
+        "fastapi ===0.21.0",  # specific version (PEP 440: version with spaces around ===)
+        "fastapi @ https://my.package.repo/fastapi-0.21.0-py3-none-any.whl",  # private repo
+        "-e git+https://github.com/mlflow/mlflow@master",  # editable mode, direct from a git repo
+        "-r requirements.txt",  # from a requirements file
+        "pytest-cov; python_version < '3.8'",  # conditional requirements
+        "fastapi @ file:///local/path/to/numpy-0.22.0-py3-none-any.whl",  # wheel from a local file
+        "-c constraints.txt",  # constraint file
+        "--no-binary :all:",  # no binary packages, source code only
+        "--prefer-binary",  # prefer binary packages over source code
+        "numpy<1.24.0",  # maximum version
+        "numpy",  # any version
+    ]
+    evaluation = _find_duplicate_requirements(packages)
+    assert sorted(evaluation) == ["fastapi", "numpy", "package"]

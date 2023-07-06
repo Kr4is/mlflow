@@ -2,23 +2,26 @@ from unittest import mock
 import pytest
 import cloudpickle
 import sklearn
+from sklearn.linear_model import LinearRegression
 from pathlib import Path
 
+from mlflow.exceptions import MlflowException
 from mlflow.pyfunc import _warn_dependency_requirement_mismatches, get_model_dependencies
+from mlflow.utils import PYTHON_VERSION
 import mlflow.utils.requirements_utils
 
 from tests.helper_functions import AnyStringWith
-from mlflow.exceptions import MlflowException
 
 
-@pytest.mark.large
-def test_warn_dependency_requirement_mismatches(tmpdir):
-    req_file = tmpdir.join("requirements.txt")
-    req_file.write(f"cloudpickle=={cloudpickle.__version__}\nscikit-learn=={sklearn.__version__}\n")
+def test_warn_dependency_requirement_mismatches(tmp_path):
+    req_file = tmp_path.joinpath("requirements.txt")
+    req_file.write_text(
+        f"cloudpickle=={cloudpickle.__version__}\nscikit-learn=={sklearn.__version__}\n"
+    )
 
     with mock.patch("mlflow.pyfunc._logger.warning") as mock_warning:
         # Test case: all packages satisfy requirements.
-        _warn_dependency_requirement_mismatches(model_path=tmpdir)
+        _warn_dependency_requirement_mismatches(model_path=tmp_path)
         mock_warning.assert_not_called()
 
         mock_warning.reset_mock()
@@ -44,7 +47,7 @@ def test_warn_dependency_requirement_mismatches(tmpdir):
                 }
             ),
         ):
-            _warn_dependency_requirement_mismatches(model_path=tmpdir)
+            _warn_dependency_requirement_mismatches(model_path=tmp_path)
             mock_warning.assert_called_once_with(
                 """
 Detected one or more mismatches between the model's dependencies and the current Python environment:
@@ -59,14 +62,14 @@ model's environment and install dependencies using the resulting environment fil
 
         mock_warning.reset_mock()
 
-        req_file.write("scikit-learn>=0.8,<=0.9")
+        req_file.write_text("scikit-learn>=0.8,<=0.9")
 
         # Test case: requirement with multiple version specifiers is satisfied
         with mock.patch(
             "mlflow.utils.requirements_utils._get_installed_version",
             gen_mock_get_installed_version_fn({"scikit-learn": "0.8.1"}),
         ):
-            _warn_dependency_requirement_mismatches(model_path=tmpdir)
+            _warn_dependency_requirement_mismatches(model_path=tmp_path)
             mock_warning.assert_not_called()
 
         mock_warning.reset_mock()
@@ -76,7 +79,7 @@ model's environment and install dependencies using the resulting environment fil
             "mlflow.utils.requirements_utils._get_installed_version",
             gen_mock_get_installed_version_fn({"scikit-learn": "0.7.1"}),
         ):
-            _warn_dependency_requirement_mismatches(model_path=tmpdir)
+            _warn_dependency_requirement_mismatches(model_path=tmp_path)
             mock_warning.assert_called_once_with(
                 AnyStringWith(" - scikit-learn (current: 0.7.1, required: scikit-learn>=0.8,<=0.9)")
             )
@@ -84,8 +87,8 @@ model's environment and install dependencies using the resulting environment fil
         mock_warning.reset_mock()
 
         # Test case: required package is uninstalled.
-        req_file.write("uninstalled-pkg==1.2.3")
-        _warn_dependency_requirement_mismatches(model_path=tmpdir)
+        req_file.write_text("uninstalled-pkg==1.2.3")
+        _warn_dependency_requirement_mismatches(model_path=tmp_path)
         mock_warning.assert_called_once_with(
             AnyStringWith(
                 " - uninstalled-pkg (current: uninstalled, required: uninstalled-pkg==1.2.3)"
@@ -95,8 +98,8 @@ model's environment and install dependencies using the resulting environment fil
         mock_warning.reset_mock()
 
         # Test case: requirement without version specifiers
-        req_file.write("mlflow")
-        _warn_dependency_requirement_mismatches(model_path=tmpdir)
+        req_file.write_text("mlflow")
+        _warn_dependency_requirement_mismatches(model_path=tmp_path)
         mock_warning.assert_not_called()
 
         mock_warning.reset_mock()
@@ -106,7 +109,7 @@ model's environment and install dependencies using the resulting environment fil
             "mlflow.pyfunc._check_requirement_satisfied",
             side_effect=RuntimeError("check_requirement_satisfied_fn_failed"),
         ):
-            _warn_dependency_requirement_mismatches(model_path=tmpdir)
+            _warn_dependency_requirement_mismatches(model_path=tmp_path)
             mock_warning.assert_called_once_with(
                 AnyStringWith(
                     "Encountered an unexpected error "
@@ -133,15 +136,15 @@ scikit-learn==1.0.2"""
     with mock.patch("mlflow.pyfunc._logger.info") as mock_log_info:
         get_model_dependencies(model_path, format="pip")
         mock_log_info.assert_called_once_with(
-            "To install these model dependencies, run the "
+            "To install the dependencies that were used to train the model, run the "
             f"following command: 'pip install -r {req_file}'."
         )
 
         mock_log_info.reset_mock()
-        with mock.patch("mlflow.pyfunc.is_in_databricks_runtime", return_value=True):
+        with mock.patch("mlflow.pyfunc._is_in_ipython_notebook", return_value=True):
             get_model_dependencies(model_path, format="pip")
             mock_log_info.assert_called_once_with(
-                "To install these model dependencies, run the "
+                "To install the dependencies that were used to train the model, run the "
                 f"following command: '%pip install -r {req_file}'."
             )
 
@@ -149,10 +152,9 @@ scikit-learn==1.0.2"""
         get_model_dependencies(model_path, format="abc")
 
 
-@pytest.mark.large
-def test_get_model_dependencies_read_conda_file(tmp_path):
-    MLmodel_file = tmp_path / "MLmodel"
-    MLmodel_file.write_text(
+@pytest.mark.parametrize(
+    "ml_model_file_content",
+    [
         """
 artifact_path: model
 flavors:
@@ -160,17 +162,35 @@ flavors:
     env: conda.yaml
     loader_module: mlflow.sklearn
     model_path: model.pkl
-    python_version: 3.7.12
+    python_version: {PYTHON_VERSION}
 model_uuid: 722a374a432f48f09ee85da92df13bca
-run_id: 765e66a5ba404650be51cb02cda66f35"""
-    )
-
+run_id: 765e66a5ba404650be51cb02cda66f35
+""",
+        f"""
+artifact_path: model
+flavors:
+  python_function:
+    env:
+      conda: conda.yaml
+      virtualenv: python_env.yaml
+    loader_module: mlflow.sklearn
+    model_path: model.pkl
+    python_version: {PYTHON_VERSION}
+model_uuid: 722a374a432f48f09ee85da92df13bca
+run_id: 765e66a5ba404650be51cb02cda66f35
+""",
+    ],
+    ids=["old_env", "new_env"],
+)
+def test_get_model_dependencies_read_conda_file(ml_model_file_content, tmp_path):
+    MLmodel_file = tmp_path / "MLmodel"
+    MLmodel_file.write_text(ml_model_file_content)
     conda_yml_file = tmp_path / "conda.yaml"
-    conda_yml_file_content = """
+    conda_yml_file_content = f"""
 channels:
 - conda-forge
 dependencies:
-- python=3.7.12
+- python={PYTHON_VERSION}
 - pip=22.0.3
 - scikit-learn=0.22.0
 - tensorflow=2.0.0
@@ -178,7 +198,8 @@ dependencies:
   - mlflow
   - cloudpickle==2.0.0
   - scikit-learn==1.0.1
-name: mlflow-env"""
+name: mlflow-env
+"""
 
     conda_yml_file.write_text(conda_yml_file_content)
 
@@ -199,20 +220,36 @@ name: mlflow-env"""
         )
         mock_warning.assert_called_once_with(
             "The following conda dependencies have been excluded from the environment file: "
-            "python=3.7.12, pip=22.0.3, scikit-learn=0.22.0, tensorflow=2.0.0."
+            f"python={PYTHON_VERSION}, pip=22.0.3, scikit-learn=0.22.0, tensorflow=2.0.0."
         )
 
     conda_yml_file.write_text(
-        """
+        f"""
 channels:
 - conda-forge
 dependencies:
-- python=3.7.12
+- python={PYTHON_VERSION}
 - pip=22.0.3
 - scikit-learn=0.22.0
 - tensorflow=2.0.0
-    """
+"""
     )
 
     with pytest.raises(MlflowException, match="No pip section found in conda.yaml file"):
         get_model_dependencies(model_path, format="pip")
+
+
+def test_get_model_dependencies_with_model_version_uri():
+    with mlflow.start_run():
+        mlflow.sklearn.log_model(LinearRegression(), "model", registered_model_name="linear")
+
+    deps = get_model_dependencies("models:/linear/1", format="pip")
+    assert f"scikit-learn=={sklearn.__version__}" in Path(deps).read_text()
+
+
+def test_warn_dependency_requirement_mismatches_ignores_file_path(tmp_path):
+    req_file = tmp_path / "requirements.txt"
+    req_file.write_text("/path/to/my.whl")
+    with mock.patch("mlflow.pyfunc._logger.warning") as mock_warning:
+        _warn_dependency_requirement_mismatches(model_path=tmp_path)
+        mock_warning.assert_not_called()

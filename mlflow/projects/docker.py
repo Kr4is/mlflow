@@ -5,17 +5,19 @@ import shutil
 import tempfile
 import urllib.parse
 import urllib.request
+import subprocess
 
 import docker
 
 from mlflow import tracking
-from mlflow.projects.utils import get_databricks_env_vars
 from mlflow.exceptions import ExecutionException
 from mlflow.projects.utils import MLFLOW_DOCKER_WORKDIR_PATH
-from mlflow.tracking.context.git_context import _get_git_commit
 from mlflow.utils import process, file_utils
+from mlflow.utils.databricks_utils import get_databricks_env_vars
 from mlflow.utils.mlflow_tags import MLFLOW_DOCKER_IMAGE_URI, MLFLOW_DOCKER_IMAGE_ID
 from mlflow.utils.file_utils import _handle_readonly_on_windows
+from mlflow.utils.git_utils import get_git_commit
+from mlflow.environment_variables import MLFLOW_TRACKING_URI
 
 _logger = logging.getLogger(__name__)
 
@@ -26,16 +28,28 @@ _PROJECT_TAR_ARCHIVE_NAME = "mlflow-project-docker-build-context"
 
 def validate_docker_installation():
     """
-    Verify if Docker is installed on host machine.
+    Verify if Docker is installed and running on host machine.
     """
-    try:
-        docker_path = "docker"
-        process._exec_cmd([docker_path, "--help"], throw_on_error=False)
-    except EnvironmentError:
+    if shutil.which("docker") is None:
         raise ExecutionException(
             "Could not find Docker executable. "
             "Ensure Docker is installed as per the instructions "
             "at https://docs.docker.com/install/overview/."
+        )
+
+    cmd = ["docker", "info"]
+    prc = process._exec_cmd(
+        cmd,
+        throw_on_error=False,
+        capture_output=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    if prc.returncode != 0:
+        joined_cmd = " ".join(cmd)
+        raise ExecutionException(
+            f"Ran `{joined_cmd}` to ensure docker daemon is running but it failed "
+            f"with the following output:\n{prc.stdout}"
         )
 
 
@@ -51,34 +65,43 @@ def validate_docker_env(project):
         )
 
 
-def build_docker_image(work_dir, repository_uri, base_image, run_id):
+def build_docker_image(work_dir, repository_uri, base_image, run_id, build_image, docker_auth):
     """
     Build a docker image containing the project in `work_dir`, using the base image.
     """
     image_uri = _get_docker_image_uri(repository_uri=repository_uri, work_dir=work_dir)
-    dockerfile = (
-        "FROM {imagename}\n COPY {build_context_path}/ {workdir}\n WORKDIR {workdir}\n"
-    ).format(
-        imagename=base_image,
-        build_context_path=_PROJECT_TAR_ARCHIVE_NAME,
-        workdir=MLFLOW_DOCKER_WORKDIR_PATH,
-    )
-    build_ctx_path = _create_docker_build_ctx(work_dir, dockerfile)
-    with open(build_ctx_path, "rb") as docker_build_ctx:
-        _logger.info("=== Building docker image %s ===", image_uri)
-        client = docker.from_env()
-        image, _ = client.images.build(
-            tag=image_uri,
-            forcerm=True,
-            dockerfile=posixpath.join(_PROJECT_TAR_ARCHIVE_NAME, _GENERATED_DOCKERFILE_NAME),
-            fileobj=docker_build_ctx,
-            custom_context=True,
-            encoding="gzip",
+    client = docker.from_env()
+    if docker_auth is not None:
+        client.login(**docker_auth)
+
+    if not build_image:
+        if not client.images.list(name=base_image):
+            _logger.info(f"Pulling {base_image}")
+            image = client.images.pull(base_image)
+        else:
+            _logger.info(f"{base_image} already exists")
+            image = client.images.get(base_image)
+        image_uri = base_image
+    else:
+        dockerfile = (
+            f"FROM {base_image}\n COPY {_PROJECT_TAR_ARCHIVE_NAME}/ {MLFLOW_DOCKER_WORKDIR_PATH}\n"
+            f" WORKDIR {MLFLOW_DOCKER_WORKDIR_PATH}\n"
         )
-    try:
-        os.remove(build_ctx_path)
-    except Exception:
-        _logger.info("Temporary docker context file %s was not deleted.", build_ctx_path)
+        build_ctx_path = _create_docker_build_ctx(work_dir, dockerfile)
+        with open(build_ctx_path, "rb") as docker_build_ctx:
+            _logger.info("=== Building docker image %s ===", image_uri)
+            image, _ = client.images.build(
+                tag=image_uri,
+                forcerm=True,
+                dockerfile=posixpath.join(_PROJECT_TAR_ARCHIVE_NAME, _GENERATED_DOCKERFILE_NAME),
+                fileobj=docker_build_ctx,
+                custom_context=True,
+                encoding="gzip",
+            )
+        try:
+            os.remove(build_ctx_path)
+        except Exception:
+            _logger.info("Temporary docker context file %s was not deleted.", build_ctx_path)
     tracking.MlflowClient().set_tag(run_id, MLFLOW_DOCKER_IMAGE_URI, image_uri)
     tracking.MlflowClient().set_tag(run_id, MLFLOW_DOCKER_IMAGE_ID, image.id)
     return image
@@ -95,7 +118,7 @@ def _get_docker_image_uri(repository_uri, work_dir):
     """
     repository_uri = repository_uri if repository_uri else "docker-project"
     # Optionally include first 7 digits of git SHA in tag name, if available.
-    git_commit = _get_git_commit(work_dir)
+    git_commit = get_git_commit(work_dir)
     version_string = ":" + git_commit[:7] if git_commit else ""
     return repository_uri + version_string
 
@@ -121,12 +144,12 @@ def _create_docker_build_ctx(work_dir, dockerfile_contents):
 
 def get_docker_tracking_cmd_and_envs(tracking_uri):
     cmds = []
-    env_vars = dict()
+    env_vars = {}
 
     local_path, container_tracking_uri = _get_local_uri_or_none(tracking_uri)
     if local_path is not None:
-        cmds = ["-v", "%s:%s" % (local_path, _MLFLOW_DOCKER_TRACKING_DIR_PATH)]
-        env_vars[tracking._TRACKING_URI_ENV_VAR] = container_tracking_uri
+        cmds = ["-v", f"{local_path}:{_MLFLOW_DOCKER_TRACKING_DIR_PATH}"]
+        env_vars[MLFLOW_TRACKING_URI.name] = container_tracking_uri
     env_vars.update(get_databricks_env_vars(tracking_uri))
     return cmds, env_vars
 

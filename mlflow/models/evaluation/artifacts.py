@@ -10,8 +10,11 @@ from collections import namedtuple
 
 from mlflow.exceptions import MlflowException
 from mlflow.models.evaluation.base import EvaluationArtifact
+from mlflow.utils.annotations import developer_stable
+from mlflow.utils.proto_json_utils import NumpyEncoder
 
 
+@developer_stable
 class ImageEvaluationArtifact(EvaluationArtifact):
     def _save(self, output_artifact_path):
         self._content.save(output_artifact_path)
@@ -20,9 +23,11 @@ class ImageEvaluationArtifact(EvaluationArtifact):
         from PIL.Image import open as open_image
 
         self._content = open_image(local_artifact_path)
+        self._content.load()  # Load image and close the file descriptor.
         return self._content
 
 
+@developer_stable
 class CsvEvaluationArtifact(EvaluationArtifact):
     def _save(self, output_artifact_path):
         self._content.to_csv(output_artifact_path, index=False)
@@ -32,6 +37,7 @@ class CsvEvaluationArtifact(EvaluationArtifact):
         return self._content
 
 
+@developer_stable
 class ParquetEvaluationArtifact(EvaluationArtifact):
     def _save(self, output_artifact_path):
         self._content.to_parquet(output_artifact_path, compression="brotli")
@@ -41,6 +47,7 @@ class ParquetEvaluationArtifact(EvaluationArtifact):
         return self._content
 
 
+@developer_stable
 class NumpyEvaluationArtifact(EvaluationArtifact):
     def _save(self, output_artifact_path):
         np.save(output_artifact_path, self._content, allow_pickle=False)
@@ -50,28 +57,31 @@ class NumpyEvaluationArtifact(EvaluationArtifact):
         return self._content
 
 
+@developer_stable
 class JsonEvaluationArtifact(EvaluationArtifact):
     def _save(self, output_artifact_path):
         with open(output_artifact_path, "w") as f:
             json.dump(self._content, f)
 
     def _load_content_from_file(self, local_artifact_path):
-        with open(local_artifact_path, "r") as f:
+        with open(local_artifact_path) as f:
             self._content = json.load(f)
         return self._content
 
 
+@developer_stable
 class TextEvaluationArtifact(EvaluationArtifact):
     def _save(self, output_artifact_path):
         with open(output_artifact_path, "w") as f:
             f.write(self._content)
 
     def _load_content_from_file(self, local_artifact_path):
-        with open(local_artifact_path, "r") as f:
+        with open(local_artifact_path) as f:
             self._content = f.read()
         return self._content
 
 
+@developer_stable
 class PickleEvaluationArtifact(EvaluationArtifact):
     def _save(self, output_artifact_path):
         with open(output_artifact_path, "wb") as f:
@@ -150,7 +160,7 @@ def _infer_artifact_type_and_ext(artifact_name, raw_artifact, custom_metric_tupl
             raise MlflowException(f"{exception_header} with path '{raw_artifact}' does not exist.")
         if not raw_artifact.is_file():
             raise MlflowException(f"{exception_header} with path '{raw_artifact}' is not a file.")
-        if raw_artifact.suffix not in _EXT_TO_ARTIFACT_MAP.keys():
+        if raw_artifact.suffix not in _EXT_TO_ARTIFACT_MAP:
             raise MlflowException(
                 f"{exception_header} with path '{raw_artifact}' does not match any of the supported"
                 f" file extensions: {', '.join(_EXT_TO_ARTIFACT_MAP.keys())}."
@@ -160,7 +170,7 @@ def _infer_artifact_type_and_ext(artifact_name, raw_artifact, custom_metric_tupl
         )
 
     # Type inference based on object type
-    if type(raw_artifact) in _TYPE_TO_ARTIFACT_MAP.keys():
+    if type(raw_artifact) in _TYPE_TO_ARTIFACT_MAP:
         return _InferredArtifactProperties(
             from_path=False,
             type=_TYPE_TO_ARTIFACT_MAP[type(raw_artifact)],
@@ -170,7 +180,7 @@ def _infer_artifact_type_and_ext(artifact_name, raw_artifact, custom_metric_tupl
     # Given as other python object, we first attempt to infer as JsonEvaluationArtifact. If that
     # fails, we store it as PickleEvaluationArtifact
     try:
-        json.dumps(raw_artifact)
+        json.dumps(raw_artifact, cls=NumpyEncoder)
         return _InferredArtifactProperties(
             from_path=False, type=JsonEvaluationArtifact, ext=".json"
         )

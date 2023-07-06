@@ -6,6 +6,7 @@ This module provides a set of utilities for interpreting and creating requiremen
 import json
 import sys
 import subprocess
+from threading import Timer
 import tempfile
 import os
 import pkg_resources
@@ -15,8 +16,10 @@ from collections import namedtuple
 import logging
 import re
 from typing import NamedTuple, Optional
+from pathlib import Path
 
 import mlflow
+from mlflow.environment_variables import MLFLOW_REQUIREMENTS_INFERENCE_TIMEOUT
 from mlflow.exceptions import MlflowException
 from mlflow.tracking.artifact_utils import _download_artifact_from_uri
 from mlflow.utils.autologging_utils.versioning import _strip_dev_version_suffix
@@ -75,7 +78,7 @@ def _join_continued_lines(lines):
 _Requirement = namedtuple("_Requirement", ["req_str", "is_constraint"])
 
 
-def _parse_requirements(requirements, is_constraint):
+def _parse_requirements(requirements, is_constraint, base_dir=None):
     """
     A simplified version of `pip._internal.req.parse_requirements` which performs the following
     operations on the given requirements file and yields the parsed requirements.
@@ -88,6 +91,8 @@ def _parse_requirements(requirements, is_constraint):
     :param requirements: A string path to a requirements file on the local filesystem or
                          an iterable of pip requirement strings.
     :param is_constraint: Indicates the parsed requirements file is a constraint file.
+    :param base_dir: If specified, resolve relative file references (e.g. '-r requirements.txt')
+                     against the specified directory.
     :return: A list of ``_Requirement`` instances.
 
     References:
@@ -98,12 +103,13 @@ def _parse_requirements(requirements, is_constraint):
     - Constraints Files:
       https://pip.pypa.io/en/stable/user_guide/#constraints-files
     """
-    if isinstance(requirements, str):
-        base_dir = os.path.dirname(requirements)
-        with open(requirements) as f:
-            requirements = f.read().splitlines()
-    else:
-        base_dir = os.getcwd()
+    if base_dir is None:
+        if isinstance(requirements, (str, Path)):
+            base_dir = os.path.dirname(requirements)
+            with open(requirements) as f:
+                requirements = f.read().splitlines()
+        else:
+            base_dir = os.getcwd()
 
     lines = map(str.strip, requirements)
     lines = map(_strip_inline_comment, lines)
@@ -150,38 +156,27 @@ def _normalize_package_name(pkg_name):
     return _NORMALIZE_REGEX.sub("-", pkg_name).lower()
 
 
-def _get_requires_recursive(pkg_name, top_pkg_name=None) -> set:
+def _get_requires(pkg_name):
+    norm_pkg_name = _normalize_package_name(pkg_name)
+    if package := pkg_resources.working_set.by_key.get(norm_pkg_name):
+        for req in package.requires():
+            yield _normalize_package_name(req.name)
+
+
+def _get_requires_recursive(pkg_name, seen_before=None):
     """
     Recursively yields both direct and transitive dependencies of the specified
     package.
-    The `top_pkg_name` argument will track what's the top-level dependency for
-    which we want to list all sub-dependencies.
-    This ensures that we don't fall into recursive loops for packages with are
-    dependant on each other.
     """
-    if top_pkg_name is None:
-        # Assume the top package
-        top_pkg_name = pkg_name
-
-    pkg_name = _normalize_package_name(pkg_name)
-    if pkg_name not in pkg_resources.working_set.by_key:
-        return
-
-    package = pkg_resources.working_set.by_key[pkg_name]
-    reqs = package.requires()
-    if len(reqs) == 0:
-        return
-
-    for req in reqs:
-        req_name = _normalize_package_name(req.name)
-        if req_name == top_pkg_name:
-            # If the top package ends up providing himself again through a
-            # recursive dependency, we don't want to consider it as a
-            # dependency
+    norm_pkg_name = _normalize_package_name(pkg_name)
+    seen_before = seen_before or {norm_pkg_name}
+    for req in _get_requires(pkg_name):
+        # Prevent infinite recursion due to cyclic dependencies
+        if req in seen_before:
             continue
-
-        yield req_name
-        yield from _get_requires_recursive(req.name, top_pkg_name)
+        seen_before.add(req)
+        yield req
+        yield from _get_requires_recursive(req, seen_before)
 
 
 def _prune_packages(packages):
@@ -191,27 +186,34 @@ def _prune_packages(packages):
     """
     packages = set(packages)
     requires = set(_flatten(map(_get_requires_recursive, packages)))
-    return packages - requires
+    # Do not exclude mlflow's dependencies
+    return packages - (requires - set(_get_requires("mlflow")))
 
 
-def _run_command(cmd):
+def _run_command(cmd, timeout_seconds, env=None):
     """
     Runs the specified command. If it exits with non-zero status, `MlflowException` is raised.
     """
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    stdout, stderr = proc.communicate()
-    stdout = stdout.decode("utf-8")
-    stderr = stderr.decode("utf-8")
-    if proc.returncode != 0:
-        msg = "\n".join(
-            [
-                f"Encountered an unexpected error while running {cmd}",
-                f"exit status: {proc.returncode}",
-                f"stdout: {stdout}",
-                f"stderr: {stderr}",
-            ]
-        )
-        raise MlflowException(msg)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+    timer = Timer(timeout_seconds, proc.kill)
+    try:
+        timer.start()
+        stdout, stderr = proc.communicate()
+        stdout = stdout.decode("utf-8")
+        stderr = stderr.decode("utf-8")
+        if proc.returncode != 0:
+            msg = "\n".join(
+                [
+                    f"Encountered an unexpected error while running {cmd}",
+                    f"exit status: {proc.returncode}",
+                    f"stdout: {stdout}",
+                    f"stderr: {stderr}",
+                ]
+            )
+            raise MlflowException(msg)
+    finally:
+        if timer.is_alive():
+            timer.cancel()
 
 
 def _get_installed_version(package, module=None):
@@ -246,19 +248,60 @@ def _capture_imported_modules(model_uri, flavor):
     """
     Runs `_capture_modules.py` in a subprocess and captures modules imported during the model
     loading procedure.
+    If flavor is `transformers`, `_capture_transformers_modules.py` is run instead.
 
     :param model_uri: The URI of the model.
     :param: flavor: The flavor name of the model.
     :return: A list of captured modules.
     """
-    # Lazily import `_capture_module` here to avoid circular imports.
-    from mlflow.utils import _capture_modules
-
     local_model_path = _download_artifact_from_uri(model_uri)
+
+    process_timeout = MLFLOW_REQUIREMENTS_INFERENCE_TIMEOUT.get()
 
     # Run `_capture_modules.py` to capture modules imported during the loading procedure
     with tempfile.TemporaryDirectory() as tmpdir:
         output_file = os.path.join(tmpdir, "imported_modules.txt")
+        # Pass the main environment variables to the subprocess for environment variable mapping
+        main_env = os.environ.copy()
+        # Reset the path variable from the main process so that the subprocess retains all
+        # main process configuration that a user has.
+        # See: ``https://github.com/mlflow/mlflow/issues/6905`` for context on minio configuration
+        # resolution in a subprocess based on PATH entries.
+        main_env["PATH"] = "/usr/sbin:/sbin:" + main_env["PATH"]
+
+        if flavor == mlflow.transformers.FLAVOR_NAME:
+            # Lazily import `_capture_transformers_module` here to avoid circular imports.
+            from mlflow.utils import _capture_transformers_modules
+
+            for module_to_throw in ["tensorflow", "torch"]:
+                try:
+                    _run_command(
+                        [
+                            sys.executable,
+                            _capture_transformers_modules.__file__,
+                            "--model-path",
+                            local_model_path,
+                            "--flavor",
+                            flavor,
+                            "--output-file",
+                            output_file,
+                            "--sys-path",
+                            json.dumps(sys.path),
+                            "--module-to-throw",
+                            module_to_throw,
+                        ],
+                        timeout_seconds=process_timeout,
+                        env=main_env,
+                    )
+                    with open(output_file) as f:
+                        return f.read().splitlines()
+
+                except MlflowException:
+                    pass
+
+        # Lazily import `_capture_module` here to avoid circular imports.
+        from mlflow.utils import _capture_modules
+
         _run_command(
             [
                 sys.executable,
@@ -272,22 +315,41 @@ def _capture_imported_modules(model_uri, flavor):
                 "--sys-path",
                 json.dumps(sys.path),
             ],
+            timeout_seconds=process_timeout,
+            env=main_env,
         )
+
         with open(output_file) as f:
             return f.read().splitlines()
 
 
+DATABRICKS_MODULES_TO_PACKAGES = {
+    "databricks.automl": ["databricks-automl-runtime"],
+    "databricks.automl_runtime": ["databricks-automl-runtime"],
+    "databricks.model_monitoring": ["databricks-model-monitoring"],
+}
 _MODULES_TO_PACKAGES = None
 _PACKAGES_TO_MODULES = None
 
 
 def _init_modules_to_packages_map():
     global _MODULES_TO_PACKAGES
-    if _MODULES_TO_PACKAGES is None and _PACKAGES_TO_MODULES is None:
+    if _MODULES_TO_PACKAGES is None:
         # Note `importlib_metada.packages_distributions` only captures packages installed into
         # Python’s site-packages directory via tools such as pip:
         # https://importlib-metadata.readthedocs.io/en/latest/using.html#using-importlib-metadata
         _MODULES_TO_PACKAGES = importlib_metadata.packages_distributions()
+
+        # Multiple packages populate the `databricks` module namespace on Databricks; to avoid
+        # bundling extraneous Databricks packages into model dependencies, we scope each module
+        # to its relevant package
+        _MODULES_TO_PACKAGES.update(DATABRICKS_MODULES_TO_PACKAGES)
+        if "databricks" in _MODULES_TO_PACKAGES:
+            _MODULES_TO_PACKAGES["databricks"] = [
+                package
+                for package in _MODULES_TO_PACKAGES["databricks"]
+                if package not in _flatten(DATABRICKS_MODULES_TO_PACKAGES.values())
+            ]
 
         # In Databricks, `_MODULES_TO_PACKAGES` doesn't contain pyspark since it's not installed
         # via pip or conda. To work around this issue, manually add pyspark.
@@ -312,7 +374,7 @@ _PyPIPackageIndex = namedtuple("_PyPIPackageIndex", ["date", "package_names"])
 
 def _load_pypi_package_index():
     pypi_index_path = pkg_resources.resource_filename(mlflow.__name__, "pypi_package_index.json")
-    with open(pypi_index_path, "r") as f:
+    with open(pypi_index_path) as f:
         index_dict = json.load(f)
 
     return _PyPIPackageIndex(
@@ -415,19 +477,15 @@ def _get_pinned_requirement(package, version=None, module=None):
         local_version_label = _get_local_version_label(version_raw)
         if local_version_label:
             version = _strip_local_version_label(version_raw)
-            msg = (
-                "Found {package} version ({version_raw}) contains a local version label "
-                "(+{local_version_label}). MLflow logged a pip requirement for this package as "
-                "'{package}=={version_logged}' without the local version label to make it "
-                "installable from PyPI. To specify pip requirements containing local version "
-                "labels, please use `conda_env` or `pip_requirements`."
-            ).format(
-                package=package,
-                version_raw=version_raw,
-                version_logged=version,
-                local_version_label=local_version_label,
-            )
-            _logger.warning(msg)
+            if not (is_in_databricks_runtime() and package in ("torch", "torchvision")):
+                msg = (
+                    f"Found {package} version ({version_raw}) contains a local version label "
+                    f"(+{local_version_label}). MLflow logged a pip requirement for this package "
+                    f"as '{package}=={version}' without the local version label to make it "
+                    "installable from PyPI. To specify pip requirements containing local version "
+                    "labels, please use `conda_env` or `pip_requirements`."
+                )
+                _logger.warning(msg)
 
         else:
             version = version_raw
@@ -447,11 +505,19 @@ class _MismatchedPackageInfo(NamedTuple):
 
 def _check_requirement_satisfied(requirement_str):
     """
-    Returns None if the current python environment satisfies the given requirement.
-    Otherwise, returns an instance of `_MismatchedPackageInfo`.
+    Checks whether the current python environment satisfies the given requirement if it is parsable
+    as a package name and a set of version specifiers, and returns a `_MismatchedPackageInfo`
+    object containing the mismatched package name, installed version, and requirement if the
+    requirement is not satisfied. Otherwise, returns None.
     """
     _init_packages_to_modules_map()
-    req = pkg_resources.Requirement.parse(requirement_str)
+    try:
+        req = pkg_resources.Requirement.parse(requirement_str)
+    except Exception:
+        # We reach here if the requirement string is a file path or a URL.
+        # Extracting the package name from the requirement string is not trivial,
+        # so we skip the check.
+        return
     pkg_name = req.name
 
     try:
@@ -462,6 +528,13 @@ def _check_requirement_satisfied(requirement_str):
             installed_version=None,
             requirement=requirement_str,
         )
+
+    if (
+        pkg_name == "mlflow"
+        and installed_version == mlflow.__version__
+        and Version(installed_version).is_devrelease
+    ):
+        return None
 
     if len(req.specifier) > 0 and not req.specifier.contains(installed_version):
         return _MismatchedPackageInfo(

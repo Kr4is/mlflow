@@ -6,6 +6,9 @@ import urllib.parse
 from mlflow.entities import FileInfo
 from mlflow.exceptions import MlflowException
 from mlflow.store.artifact.artifact_repo import ArtifactRepository
+from mlflow.tracking._tracking_service.utils import _get_default_host_creds
+
+from mlflow.environment_variables import MLFLOW_ARTIFACT_UPLOAD_DOWNLOAD_TIMEOUT
 
 
 class AzureBlobArtifactRepository(ArtifactRepository):
@@ -23,6 +26,9 @@ class AzureBlobArtifactRepository(ArtifactRepository):
     def __init__(self, artifact_uri, client=None):
         super().__init__(artifact_uri)
 
+        _DEFAULT_TIMEOUT = 600  # 10 minutes
+        self.write_timeout = MLFLOW_ARTIFACT_UPLOAD_DOWNLOAD_TIMEOUT.get() or _DEFAULT_TIMEOUT
+
         # Allow override for testing
         if client:
             self.client = client
@@ -33,14 +39,15 @@ class AzureBlobArtifactRepository(ArtifactRepository):
         (_, account, _, api_uri_suffix) = AzureBlobArtifactRepository.parse_wasbs_uri(artifact_uri)
         if "AZURE_STORAGE_CONNECTION_STRING" in os.environ:
             self.client = BlobServiceClient.from_connection_string(
-                conn_str=os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
+                conn_str=os.environ.get("AZURE_STORAGE_CONNECTION_STRING"),
+                connection_verify=_get_default_host_creds(artifact_uri).verify,
             )
         elif "AZURE_STORAGE_ACCESS_KEY" in os.environ:
-            account_url = "https://{account}.{api_uri_suffix}".format(
-                account=account, api_uri_suffix=api_uri_suffix
-            )
+            account_url = f"https://{account}.{api_uri_suffix}"
             self.client = BlobServiceClient(
-                account_url=account_url, credential=os.environ.get("AZURE_STORAGE_ACCESS_KEY")
+                account_url=account_url,
+                credential=os.environ.get("AZURE_STORAGE_ACCESS_KEY"),
+                connection_verify=_get_default_host_creds(artifact_uri).verify,
             )
         else:
             try:
@@ -51,11 +58,11 @@ class AzureBlobArtifactRepository(ArtifactRepository):
                     "Please install it via: pip install azure-identity"
                 ) from exc
 
-            account_url = "https://{account}.{api_uri_suffix}".format(
-                account=account, api_uri_suffix=api_uri_suffix
-            )
+            account_url = f"https://{account}.{api_uri_suffix}"
             self.client = BlobServiceClient(
-                account_url=account_url, credential=DefaultAzureCredential()
+                account_url=account_url,
+                credential=DefaultAzureCredential(),
+                connection_verify=_get_default_host_creds(artifact_uri).verify,
             )
 
     @staticmethod
@@ -90,7 +97,9 @@ class AzureBlobArtifactRepository(ArtifactRepository):
             dest_path = posixpath.join(dest_path, artifact_path)
         dest_path = posixpath.join(dest_path, os.path.basename(local_file))
         with open(local_file, "rb") as file:
-            container_client.upload_blob(dest_path, file, overwrite=True)
+            container_client.upload_blob(
+                dest_path, file, overwrite=True, timeout=self.write_timeout
+            )
 
     def log_artifacts(self, local_dir, artifact_path=None):
         (container, _, dest_path, _) = self.parse_wasbs_uri(self.artifact_uri)
@@ -98,7 +107,7 @@ class AzureBlobArtifactRepository(ArtifactRepository):
         if artifact_path:
             dest_path = posixpath.join(dest_path, artifact_path)
         local_dir = os.path.abspath(local_dir)
-        for (root, _, filenames) in os.walk(local_dir):
+        for root, _, filenames in os.walk(local_dir):
             upload_path = dest_path
             if root != local_dir:
                 rel_path = os.path.relpath(root, local_dir)
@@ -107,7 +116,9 @@ class AzureBlobArtifactRepository(ArtifactRepository):
                 remote_file_path = posixpath.join(upload_path, f)
                 local_file_path = os.path.join(root, f)
                 with open(local_file_path, "rb") as file:
-                    container_client.upload_blob(remote_file_path, file, overwrite=True)
+                    container_client.upload_blob(
+                        remote_file_path, file, overwrite=True, timeout=self.write_timeout
+                    )
 
     def list_artifacts(self, path=None):
         # Newer versions of `azure-storage-blob` (>= 12.4.0) provide a public
@@ -119,6 +130,9 @@ class AzureBlobArtifactRepository(ArtifactRepository):
         except ImportError:
             from azure.storage.blob._models import BlobPrefix
 
+        def is_dir(result):
+            return isinstance(result, BlobPrefix)
+
         (container, _, artifact_path, _) = self.parse_wasbs_uri(self.artifact_uri)
         container_client = self.client.get_container_client(container)
         dest_path = artifact_path
@@ -127,21 +141,28 @@ class AzureBlobArtifactRepository(ArtifactRepository):
         infos = []
         prefix = dest_path if dest_path.endswith("/") else dest_path + "/"
         results = container_client.walk_blobs(name_starts_with=prefix)
-        for r in results:
-            if not r.name.startswith(artifact_path):
+
+        for result in results:
+            if (
+                dest_path == result.name
+            ):  # result isn't actually a child of the path we're interested in, so skip it
+                continue
+
+            if not result.name.startswith(artifact_path):
                 raise MlflowException(
                     "The name of the listed Azure blob does not begin with the specified"
-                    " artifact path. Artifact path: {artifact_path}. Blob name:"
-                    " {blob_name}".format(artifact_path=artifact_path, blob_name=r.name)
+                    f" artifact path. Artifact path: {artifact_path}. Blob name: {result.name}"
                 )
-            if isinstance(r, BlobPrefix):  # This is a prefix for items in a subdirectory
-                subdir = posixpath.relpath(path=r.name, start=artifact_path)
+
+            if is_dir(result):
+                subdir = posixpath.relpath(path=result.name, start=artifact_path)
                 if subdir.endswith("/"):
                     subdir = subdir[:-1]
-                infos.append(FileInfo(subdir, True, None))
+                infos.append(FileInfo(subdir, is_dir=True, file_size=None))
             else:  # Just a plain old blob
-                file_name = posixpath.relpath(path=r.name, start=artifact_path)
-                infos.append(FileInfo(file_name, False, r.size))
+                file_name = posixpath.relpath(path=result.name, start=artifact_path)
+                infos.append(FileInfo(file_name, is_dir=False, file_size=result.size))
+
         # The list_artifacts API expects us to return an empty list if the
         # the path references a single file.
         rel_path = dest_path[len(artifact_path) + 1 :]

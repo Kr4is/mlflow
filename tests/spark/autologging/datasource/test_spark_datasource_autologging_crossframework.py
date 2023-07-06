@@ -8,9 +8,6 @@ import mlflow
 import mlflow.spark
 
 from tests.spark.autologging.utils import _assert_spark_data_logged
-from tests.spark.autologging.utils import spark_session  # pylint: disable=unused-import
-from tests.spark.autologging.utils import format_to_file_path  # pylint: disable=unused-import
-from tests.spark.autologging.utils import file_path, data_format  # pylint: disable=unused-import
 
 
 @pytest.fixture()
@@ -57,7 +54,6 @@ def _fit_sklearn_model(pandas_df):
         return _fit_sklearn_model_no_active_run(pandas_df)
 
 
-@pytest.mark.large
 def test_spark_autologging_with_sklearn_autologging(spark_session, data_format, file_path):
     assert mlflow.active_run() is None
     mlflow.spark.autolog()
@@ -75,7 +71,6 @@ def test_spark_autologging_with_sklearn_autologging(spark_session, data_format, 
     assert mlflow.active_run() is None
 
 
-@pytest.mark.large
 def test_spark_sklearn_autologging_context_provider(spark_session, data_format, file_path):
     mlflow.spark.autolog()
     mlflow.sklearn.autolog()
@@ -104,7 +99,6 @@ def test_spark_sklearn_autologging_context_provider(spark_session, data_format, 
     assert mlflow.active_run() is None
 
 
-@pytest.mark.large
 def test_spark_and_sklearn_autologging_all_runs_managed(spark_session, data_format, file_path):
     mlflow.spark.autolog()
     mlflow.sklearn.autolog()

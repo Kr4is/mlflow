@@ -16,7 +16,7 @@ from sqlalchemy import (
     BigInteger,
     PrimaryKeyConstraint,
 )
-from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import declarative_base
 
 Base = declarative_base()
 
@@ -70,7 +70,7 @@ class SqlExperiment(Base):
     )
 
     def __repr__(self):
-        return "<SqlExperiment ({}, {})>".format(self.experiment_id, self.name)
+        return f"<SqlExperiment ({self.experiment_id}, {self.name})>"
 
 
 class SqlRun(Base):
@@ -117,6 +117,10 @@ class SqlRun(Base):
     end_time = Column(BigInteger, nullable=True, default=None)
     """
     Run end time: `BigInteger`.
+    """
+    deleted_time = Column(BigInteger, nullable=True, default=None)
+    """
+    Run deleted time: `BigInteger`. Timestamp of when run is deleted, defaults to none.
     """
     source_version = Column(String(50))
     """
@@ -175,7 +179,7 @@ class SqlTag(Base):
     __table_args__ = (PrimaryKeyConstraint("key", "run_uuid", name="tag_pk"),)
 
     def __repr__(self):
-        return "<SqlRunTag({}, {})>".format(self.key, self.value)
+        return f"<SqlRunTag({self.key}, {self.value})>"
 
 
 class SqlMetric(Base):
@@ -207,7 +211,7 @@ class SqlMetric(Base):
     __table_args__ = (PrimaryKeyConstraint("key", "timestamp", "run_uuid", name="metric_pk"),)
 
     def __repr__(self):
-        return "<SqlMetric({}, {}, {})>".format(self.key, self.value, self.timestamp)
+        return f"<SqlMetric({self.key}, {self.value}, {self.timestamp})>"
 
 
 class SqlParam(Base):
@@ -234,4 +238,4 @@ class SqlParam(Base):
     __table_args__ = (PrimaryKeyConstraint("key", "run_uuid", name="param_pk"),)
 
     def __repr__(self):
-        return "<SqlParam({}, {})>".format(self.key, self.value)
+        return f"<SqlParam({self.key}, {self.value})>"

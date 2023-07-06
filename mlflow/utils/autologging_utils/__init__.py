@@ -1,9 +1,10 @@
 # pylint: disable=unused-wildcard-import,wildcard-import
 
+import contextlib
 import inspect
 import logging
 import time
-import contextlib
+from typing import List
 
 import mlflow
 from mlflow.entities import Metric
@@ -30,6 +31,8 @@ from mlflow.utils.autologging_utils.versioning import (
     is_flavor_supported_for_associated_package_versions,
 )
 
+from mlflow.utils.autologging_utils.events import AutologgingEventLogger
+
 # Wildcard import other autologging utilities (e.g. safety utilities, event logging utilities) used
 # in autologging integration implementations, which reference them via the
 # `mlflow.utils.autologging_utils` module
@@ -42,7 +45,6 @@ INPUT_EXAMPLE_SAMPLE_ROWS = 5
 ENSURE_AUTOLOGGING_ENABLED_TEXT = (
     "please ensure that autologging is enabled before constructing the dataset."
 )
-_AUTOLOGGING_TEST_MODE_ENV_VAR = "MLFLOW_AUTOLOGGING_TESTING"
 
 # Flag indicating whether autologging is globally disabled for all integrations.
 _AUTOLOGGING_GLOBALLY_DISABLED = False
@@ -100,7 +102,7 @@ def get_mlflow_run_params_for_fn_args(fn, args, kwargs, unlogged=None):
     return params_to_log
 
 
-def log_fn_args_as_params(fn, args, kwargs, unlogged=None):  # pylint: disable=W0102
+def log_fn_args_as_params(fn, args, kwargs, unlogged=None):
     """
     Log arguments explicitly passed to a function as MLflow Run parameters to the current active
     MLflow Run.
@@ -179,6 +181,15 @@ def resolve_input_example_and_signature(
             model_signature = infer_model_signature(input_example)
         except Exception as e:
             model_signature_user_msg = "Failed to infer model signature: " + str(e)
+
+    # disable input_example signature inference in model logging if `log_model_signature`
+    # is set to `False` or signature inference in autologging fails
+    if (
+        model_signature is None
+        and input_example is not None
+        and (not log_model_signature or model_signature_user_msg is not None)
+    ):
+        model_signature = False
 
     if log_input_example and input_example_user_msg is not None:
         logger.warning(input_example_user_msg)
@@ -265,7 +276,6 @@ class BatchMetricsLogger:
             step = 0
 
         for key, value in metrics.items():
-
             self.data.append(Metric(key, value, int(current_timestamp * 1000), step))
 
         if self._should_flush():
@@ -303,9 +313,7 @@ def gen_autologging_package_version_requirements_doc(integration_name):
     """
     _, module_key = FLAVOR_TO_MODULE_NAME_AND_VERSION_INFO_KEY[integration_name]
     min_ver, max_ver, pip_release = get_min_max_version_and_pip_release(module_key)
-    required_pkg_versions = "``{min_ver}`` <= ``{pip_release}`` <= ``{max_ver}``".format(
-        min_ver=min_ver, pip_release=pip_release, max_ver=max_ver
-    )
+    required_pkg_versions = f"``{min_ver}`` <= ``{pip_release}`` <= ``{max_ver}``"
 
     return (
         "    .. Note:: Autologging is known to be compatible with the following package versions: "
@@ -349,13 +357,13 @@ def autologging_integration(name):
     def validate_param_spec(param_spec):
         if "disable" not in param_spec or param_spec["disable"].default is not False:
             raise Exception(
-                "Invalid `autolog()` function for integration '{}'. `autolog()` functions"
-                " must specify a 'disable' argument with default value 'False'".format(name)
+                f"Invalid `autolog()` function for integration '{name}'. `autolog()` functions"
+                " must specify a 'disable' argument with default value 'False'"
             )
         elif "silent" not in param_spec or param_spec["silent"].default is not False:
             raise Exception(
-                "Invalid `autolog()` function for integration '{}'. `autolog()` functions"
-                " must specify a 'silent' argument with default value 'False'".format(name)
+                f"Invalid `autolog()` function for integration '{name}'. `autolog()` functions"
+                " must specify a 'silent' argument with default value 'False'"
             )
 
     def wrapper(_autolog):
@@ -422,8 +430,8 @@ def autologging_integration(name):
         wrapped_autolog.integration_name = name
 
         if name in FLAVOR_TO_MODULE_NAME_AND_VERSION_INFO_KEY:
-            wrapped_autolog.__doc__ = (
-                gen_autologging_package_version_requirements_doc(name) + wrapped_autolog.__doc__
+            wrapped_autolog.__doc__ = gen_autologging_package_version_requirements_doc(name) + (
+                wrapped_autolog.__doc__ or ""
             )
         return wrapped_autolog
 
@@ -478,6 +486,34 @@ def disable_autologging():
     _AUTOLOGGING_GLOBALLY_DISABLED = False
 
 
+@contextlib.contextmanager
+def disable_discrete_autologging(flavors_to_disable: List[str]) -> None:
+    """
+    Context manager for disabling specific autologging integrations temporarily while another
+    flavor's autologging is activated. This context wrapper is useful in the event that, for
+    example, a particular library calls upon another library within a training API that has a
+    current MLflow autologging integration.
+    For instance, the transformers library's Trainer class, when running metric scoring,
+    builds a sklearn model and runs evaluations as part of its accuracy scoring. Without this
+    temporary autologging disabling, a new run will be generated that contains a sklearn model
+    that holds no use for tracking purposes as it is only used during the metric evaluation phase
+    of training.
+    :param flavors_to_disable: A list of flavors that need to be temporarily disabled while
+                               executing another flavor's autologging to prevent spurious run
+                               logging of unrelated models, metrics, and parameters.
+    """
+    enabled_flavors = []
+    for flavor in flavors_to_disable:
+        if not autologging_is_disabled(flavor):
+            enabled_flavors.append(flavor)
+            autolog_func = getattr(mlflow, flavor)
+            autolog_func.autolog(disable=True)
+    yield
+    for flavor in enabled_flavors:
+        autolog_func = getattr(mlflow, flavor)
+        autolog_func.autolog(disable=False)
+
+
 def _get_new_training_session_class():
     """
     Returns a session manager class for nested autologging runs.
@@ -506,6 +542,7 @@ def _get_new_training_session_class():
     ...             print(c1.should_log(), c2.should_log())
     True False
     """
+
     # NOTE: The current implementation doesn't guarantee thread-safety, but that's okay for now
     # because:
     # 1. We don't currently have any use cases for allow_children=True.
@@ -514,16 +551,16 @@ def _get_new_training_session_class():
     class _TrainingSession:
         _session_stack = []
 
-        def __init__(self, clazz, allow_children=True):
+        def __init__(self, estimator, allow_children=True):
             """
             A session manager for nested autologging runs.
 
-            :param clazz: A class object that this session originates from.
+            :param estimator: An estimator that this session originates from.
             :param allow_children: If True, allows autologging in child sessions.
                                    If False, disallows autologging in all descendant sessions.
             """
             self.allow_children = allow_children
-            self.clazz = clazz
+            self.estimator = estimator
             self._parent = None
 
         def __enter__(self):
@@ -543,16 +580,26 @@ def _get_new_training_session_class():
             Returns True when at least one of the following conditions satisfies:
 
             1. This session is the root session.
-            2. The parent session allows autologging and its class differs from this session's
-               class.
+            2. The parent session allows autologging and its estimator differs from this session's
+               estimator.
             """
-            return (self._parent is None) or (
-                self._parent.allow_children and self._parent.clazz != self.clazz
-            )
+            for training_session in _TrainingSession._session_stack:
+                if training_session is self:
+                    break
+                elif training_session.estimator is self.estimator:
+                    return False
+
+            return self._parent is None or self._parent.allow_children
 
         @staticmethod
         def is_active():
             return len(_TrainingSession._session_stack) != 0
+
+        @staticmethod
+        def get_current_session():
+            if _TrainingSession.is_active():
+                return _TrainingSession._session_stack[-1]
+            return None
 
     return _TrainingSession
 

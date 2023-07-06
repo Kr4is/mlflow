@@ -16,20 +16,11 @@ currently run ML code (e.g. in notebooks, standalone applications or the cloud).
   Docker, Apache Spark, Azure ML and AWS SageMaker.
 * `MLflow Model Registry <https://mlflow.org/docs/latest/model-registry.html>`_: A centralized model store, set of APIs, and UI, to collaboratively manage the full lifecycle of MLflow Models.
 
-|docs| |labeling| |examples| |cross-version-tests| |pypi| |conda-forge| |cran| |maven| |license| |downloads| |slack| |twitter|
+|docs| |pypi| |conda-forge| |cran| |maven| |license| |downloads| |slack| |twitter|
 
 .. |docs| image:: https://img.shields.io/badge/docs-latest-success.svg?style=for-the-badge
     :target: https://mlflow.org/docs/latest/index.html
     :alt: Latest Docs
-.. |labeling| image:: https://img.shields.io/github/workflow/status/mlflow/mlflow/Labeling?label=Labeling&style=for-the-badge&logo=github
-    :target: https://github.com/mlflow/mlflow/actions?query=workflow%3ALabeling
-    :alt: Labeling Action Status
-.. |examples| image:: https://img.shields.io/github/workflow/status/mlflow/mlflow/Examples?event=schedule&label=Examples&style=for-the-badge&logo=github
-    :target: https://github.com/mlflow/mlflow/actions?query=workflow%3AExamples+event%3Aschedule
-    :alt: Examples Action Status
-.. |cross-version-tests| image:: https://img.shields.io/github/workflow/status/mlflow/mlflow/Cross%20version%20tests?event=schedule&label=Cross%20version%20tests&style=for-the-badge&logo=github
-    :target: https://github.com/mlflow/mlflow/actions?query=workflow%3ACross%2Bversion%2Btests+event%3Aschedule
-    :alt: Examples Action Status
 .. |pypi| image:: https://img.shields.io/pypi/v/mlflow.svg?style=for-the-badge&logo=pypi&logoColor=white
     :target: https://pypi.org/project/mlflow/
     :alt: Latest Python Release
@@ -54,10 +45,26 @@ currently run ML code (e.g. in notebooks, standalone applications or the cloud).
 .. |twitter| image:: https://img.shields.io/twitter/follow/MLflow?style=for-the-badge&labelColor=00ACEE&logo=twitter&logoColor=white
     :target: https://twitter.com/MLflow
     :alt: Account Twitter
-    
 
+.. _Slack: https://join.slack.com/t/mlflow-users/shared_invite/zt-1iffrtbly-UNU8hV03aV8feUeGmqf_uA
 
-.. _Slack: https://join.slack.com/t/mlflow-users/shared_invite/zt-g6qwro5u-odM7pRnZxNX_w56mcsHp8g
+Job Statuses
+
+|examples| |cross-version-tests| |r-devel| |test-requirements| |stale| |push-images|
+
+.. |examples| image:: https://img.shields.io/github/actions/workflow/status/mlflow/mlflow/examples.yml?branch=master&event=schedule&label=Examples&style=for-the-badge&logo=github
+    :target: https://github.com/mlflow/mlflow/actions?query=workflow%3AExamples+event%3Aschedule
+    :alt: Examples Action Status
+.. |cross-version-tests| image:: https://img.shields.io/github/actions/workflow/status/mlflow/mlflow/cross-version-tests.yml?branch=master&event=schedule&label=Cross%20version%20tests&style=for-the-badge&logo=github
+    :target: https://github.com/mlflow/mlflow/actions?query=workflow%3ACross%2Bversion%2Btests+event%3Aschedule
+.. |r-devel| image:: https://img.shields.io/github/actions/workflow/status/mlflow/mlflow/r.yml?branch=master&event=schedule&label=r-devel&style=for-the-badge&logo=github
+    :target: https://github.com/mlflow/mlflow/actions?query=workflow%3AR+event%3Aschedule
+.. |test-requirements| image:: https://img.shields.io/github/actions/workflow/status/mlflow/mlflow/requirements.yml?branch=master&event=schedule&label=test%20requirements&logo=github&style=for-the-badge
+    :target: https://github.com/mlflow/mlflow/actions?query=workflow%3ATest%2Brequirements+event%3Aschedule
+.. |stale| image:: https://img.shields.io/github/actions/workflow/status/mlflow/mlflow/stale.yml?branch=master&event=schedule&label=stale&logo=github&style=for-the-badge
+    :target: https://github.com/mlflow/mlflow/actions?query=workflow%3AStale+event%3Aschedule
+.. |push-images| image:: https://img.shields.io/github/actions/workflow/status/mlflow/mlflow/push-images.yml?event=release&label=push-images&logo=github&style=for-the-badge
+    :target: https://github.com/mlflow/mlflow/actions/workflows/push-images.yml?query=event%3Arelease
 
 Installing
 ----------
@@ -111,7 +118,7 @@ Start it with::
 **Note:** Running ``mlflow ui`` from within a clone of MLflow is not recommended - doing so will
 run the dev UI from source. We recommend running the UI from a different working directory,
 specifying a backend store via the ``--backend-store-uri`` option. Alternatively, see
-instructions for running the dev UI in the `contributor guide <CONTRIBUTING.rst>`_.
+instructions for running the dev UI in the `contributor guide <CONTRIBUTING.md>`_.
 
 
 Running a Project from a URI
@@ -138,11 +145,38 @@ MLflow artifacts and then load them again for serving. There is an example train
 
     $ mlflow models serve --model-uri runs:/<run-id>/model
 
-    $ curl -d '{"columns":[0],"index":[0,1],"data":[[1],[-1]]}' -H 'Content-Type: application/json'  localhost:5000/invocations
+    $ curl -d '{"dataframe_split": {"columns":[0],"index":[0,1],"data":[[1],[-1]]}}' -H 'Content-Type: application/json'  localhost:5000/invocations
 
+**Note:** If using MLflow skinny (``pip install mlflow-skinny``) for model serving, additional
+required dependencies (namely, ``flask``) will need to be installed for the MLflow server to function.
+
+Official MLflow Docker Image
+----------------------------
+
+The official MLflow Docker image is available on GitHub Container Registry at https://ghcr.io/mlflow/mlflow.
+
+.. code-block:: shell
+
+    export CR_PAT=YOUR_TOKEN
+    echo $CR_PAT | docker login ghcr.io -u USERNAME --password-stdin
+    # Pull the latest version
+    docker pull ghcr.io/mlflow/mlflow
+    # Pull 2.2.1
+    docker pull ghcr.io/mlflow/mlflow:v2.2.1
 
 Contributing
 ------------
 We happily welcome contributions to MLflow. We are also seeking contributions to items on the
 `MLflow Roadmap <https://github.com/mlflow/mlflow/milestone/3>`_. Please see our
-`contribution guide <CONTRIBUTING.rst>`_ to learn more about contributing to MLflow.
+`contribution guide <CONTRIBUTING.md>`_ to learn more about contributing to MLflow.
+
+Maintainers
+-----------
+
+MLflow is currently maintained by the following members with significant contributions from hundreds of exceptionally talented community members.
+
+- `Harutaka Kawamura <https://github.com/harupy>`_
+- `Weichen Xu <https://github.com/WeichenXu123>`_
+- `Corey Zumar <https://github.com/dbczumar>`_
+- `Ben Wilson <https://github.com/BenWilson2>`_
+- `Serena Ruan <https://github.com/serena-ruan>`_

@@ -8,8 +8,8 @@ from mlflow.utils.file_utils import TempDir
 
 
 @pytest.fixture
-def local_artifact_root(tmpdir):
-    return str(tmpdir)
+def local_artifact_root(tmp_path):
+    return str(tmp_path)
 
 
 @pytest.fixture
@@ -186,3 +186,7 @@ def test_delete_artifacts(local_artifact_repo):
         assert os.path.exists(os.path.join(local_artifact_repo._artifact_dir, "b.txt"))
         local_artifact_repo.delete_artifacts()
         assert not os.path.exists(os.path.join(local_artifact_repo._artifact_dir))
+
+
+def test_delete_artifacts_with_nonexistent_path_succeeds(local_artifact_repo):
+    local_artifact_repo.delete_artifacts("nonexistent")

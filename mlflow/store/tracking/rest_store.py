@@ -1,4 +1,6 @@
-from mlflow.entities import Experiment, Run, RunInfo, Metric, ViewType
+from typing import List, Optional
+
+from mlflow.entities import Experiment, Run, RunInfo, Metric, ViewType, DatasetInput
 from mlflow.exceptions import MlflowException
 from mlflow.protos import databricks_pb2
 from mlflow.protos.service_pb2 import (
@@ -7,7 +9,7 @@ from mlflow.protos.service_pb2 import (
     GetExperiment,
     GetRun,
     SearchRuns,
-    ListExperiments,
+    SearchExperiments,
     GetMetricHistory,
     LogMetric,
     LogParam,
@@ -24,6 +26,7 @@ from mlflow.protos.service_pb2 import (
     DeleteTag,
     SetExperimentTag,
     GetExperimentByName,
+    LogInputs,
 )
 from mlflow.store.tracking.abstract_store import AbstractStore
 from mlflow.store.entities.paged_list import PagedList
@@ -55,29 +58,25 @@ class RestStore(AbstractStore):
         response_proto = api.Response()
         return call_endpoint(self.get_host_creds(), endpoint, method, json_body, response_proto)
 
-    def list_experiments(
+    def search_experiments(
         self,
         view_type=ViewType.ACTIVE_ONLY,
         max_results=None,
+        filter_string=None,
+        order_by=None,
         page_token=None,
     ):
-        """
-        :param view_type: Qualify requested type of experiments.
-        :param max_results: If passed, specifies the maximum number of experiments desired. If not
-                            passed, the server will pick a maximum number of results to return.
-        :param page_token: Token specifying the next page of results. It should be obtained from
-                            a ``list_experiments`` call.
-        :return: A :py:class:`PagedList <mlflow.store.entities.PagedList>` of
-                 :py:class:`Experiment <mlflow.entities.Experiment>` objects. The pagination token
-                 for the next page can be obtained via the ``token`` attribute of the object.
-        """
         req_body = message_to_json(
-            ListExperiments(view_type=view_type, max_results=max_results, page_token=page_token)
+            SearchExperiments(
+                view_type=view_type,
+                max_results=max_results,
+                page_token=page_token,
+                order_by=order_by,
+                filter=filter_string,
+            )
         )
-        response_proto = self._call_endpoint(ListExperiments, req_body)
+        response_proto = self._call_endpoint(SearchExperiments, req_body)
         experiments = [Experiment.from_proto(x) for x in response_proto.experiments]
-        # If the response doesn't contain `next_page_token`, `response_proto.next_page_token`
-        # returns an empty string (default value for a string proto field).
         token = (
             response_proto.next_page_token if response_proto.HasField("next_page_token") else None
         )
@@ -138,15 +137,21 @@ class RestStore(AbstractStore):
         response_proto = self._call_endpoint(GetRun, req_body)
         return Run.from_proto(response_proto.run)
 
-    def update_run_info(self, run_id, run_status, end_time):
+    def update_run_info(self, run_id, run_status, end_time, run_name):
         """Updates the metadata of the specified run."""
         req_body = message_to_json(
-            UpdateRun(run_uuid=run_id, run_id=run_id, status=run_status, end_time=end_time)
+            UpdateRun(
+                run_uuid=run_id,
+                run_id=run_id,
+                status=run_status,
+                end_time=end_time,
+                run_name=run_name,
+            )
         )
         response_proto = self._call_endpoint(UpdateRun, req_body)
         return RunInfo.from_proto(response_proto.run_info)
 
-    def create_run(self, experiment_id, user_id, start_time, tags):
+    def create_run(self, experiment_id, user_id, start_time, tags, run_name):
         """
         Create a run under the specified experiment ID, setting the run's status to "RUNNING"
         and the start time to the current time.
@@ -155,9 +160,11 @@ class RestStore(AbstractStore):
         :param user_id: ID of the user launching this run
         :param start_time: timestamp of the initialization of the run
         :param tags: tags to apply to this run at initialization
+        :param name: Name of this run.
 
         :return: The created Run object
         """
+
         tag_protos = [tag.to_proto() for tag in tags]
         req_body = message_to_json(
             CreateRun(
@@ -165,6 +172,7 @@ class RestStore(AbstractStore):
                 user_id=user_id,
                 start_time=start_time,
                 tags=tag_protos,
+                run_name=run_name,
             )
         )
         response_proto = self._call_endpoint(CreateRun, req_body)
@@ -235,20 +243,34 @@ class RestStore(AbstractStore):
         req_body = message_to_json(DeleteTag(run_id=run_id, key=key))
         self._call_endpoint(DeleteTag, req_body)
 
-    def get_metric_history(self, run_id, metric_key):
+    def get_metric_history(self, run_id, metric_key, max_results=None, page_token=None):
         """
         Return all logged values for a given metric.
 
         :param run_id: Unique identifier for run
         :param metric_key: Metric name within the run
+        :param max_results: Maximum number of metric history events (steps) to return per paged
+            query. Only supported in 'databricks' backend.
+        :param page_token: A Token specifying the next paginated set of results of metric history.
 
-        :return: A list of :py:class:`mlflow.entities.Metric` entities if logged, else empty list
+        :return: A PagedList of :py:class:`mlflow.entities.Metric` entities if a paginated request
+            is made by setting ``max_results`` to a value other than ``None``, a List of
+            :py:class:`mlflow.entities.Metric` entities if ``max_results`` is None, else, if no
+            metrics of the ``metric_key`` have been logged to the ``run_id``, an empty list.
         """
         req_body = message_to_json(
-            GetMetricHistory(run_uuid=run_id, run_id=run_id, metric_key=metric_key)
+            GetMetricHistory(
+                run_uuid=run_id,
+                run_id=run_id,
+                metric_key=metric_key,
+                max_results=max_results,
+                page_token=page_token,
+            )
         )
         response_proto = self._call_endpoint(GetMetricHistory, req_body)
-        return [Metric.from_proto(metric) for metric in response_proto.metrics]
+
+        metric_history = [Metric.from_proto(metric) for metric in response_proto.metrics]
+        return PagedList(metric_history, response_proto.next_page_token or None)
 
     def _search_runs(
         self, experiment_ids, filter_string, run_view_type, max_results, order_by, page_token
@@ -289,15 +311,8 @@ class RestStore(AbstractStore):
                 databricks_pb2.RESOURCE_DOES_NOT_EXIST
             ):
                 return None
-            elif e.error_code == databricks_pb2.ErrorCode.Name(
-                databricks_pb2.REQUEST_LIMIT_EXCEEDED
-            ):
-                raise e
-            # Fall back to using ListExperiments-based implementation.
-            for experiment in self.list_experiments(ViewType.ALL):
-                if experiment.name == experiment_name:
-                    return experiment
-            return None
+            else:
+                raise
 
     def log_batch(self, run_id, metrics, params, tags):
         metric_protos = [metric.to_proto() for metric in metrics]
@@ -312,41 +327,16 @@ class RestStore(AbstractStore):
         req_body = message_to_json(LogModel(run_id=run_id, model_json=mlflow_model.to_json()))
         self._call_endpoint(LogModel, req_body)
 
+    def log_inputs(self, run_id: str, datasets: Optional[List[DatasetInput]] = None):
+        """
+        Log inputs, such as datasets, to the specified run.
 
-class DatabricksRestStore(RestStore):
-    """
-    Databricks-specific RestStore implementation that provides different fallback
-    behavior when hitting the GetExperimentByName REST API fails - in particular, we only
-    fall back to ListExperiments when the server responds with ENDPOINT_NOT_FOUND, rather than
-    on all internal server errors. This implementation should be deprecated once
-    GetExperimentByName is available everywhere.
-    """
+        :param run_id: String id for the run
+        :param datasets: List of :py:class:`mlflow.entities.DatasetInput` instances to log
+                         as inputs to the run.
 
-    def get_experiment_by_name(self, experiment_name):
-        try:
-            req_body = message_to_json(GetExperimentByName(experiment_name=experiment_name))
-            response_proto = self._call_endpoint(GetExperimentByName, req_body)
-            return Experiment.from_proto(response_proto.experiment)
-        except MlflowException as e:
-            if e.error_code == databricks_pb2.ErrorCode.Name(
-                databricks_pb2.RESOURCE_DOES_NOT_EXIST
-            ):
-                return None
-            elif e.error_code == databricks_pb2.ErrorCode.Name(databricks_pb2.ENDPOINT_NOT_FOUND):
-                # Fall back to using ListExperiments-based implementation.
-                for experiments in self._paginate_list_experiments(ViewType.ALL):
-                    for experiment in experiments:
-                        if experiment.name == experiment_name:
-                            return experiment
-                return None
-            raise e
-
-    def _paginate_list_experiments(self, view_type):
-        page_token = None
-        while True:
-            experiments = self.list_experiments(view_type=view_type, page_token=page_token)
-            yield experiments
-
-            if not experiments.token:
-                break
-            page_token = experiments.token
+        :return: None.
+        """
+        datasets_protos = [dataset.to_proto() for dataset in datasets]
+        req_body = message_to_json(LogInputs(run_id=run_id, datasets=datasets_protos))
+        self._call_endpoint(LogInputs, req_body)

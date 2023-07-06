@@ -2,16 +2,17 @@ import abc
 import inspect
 import itertools
 import functools
-import os
 import uuid
 from abc import abstractmethod
 from contextlib import contextmanager
+import typing
 
 import mlflow
 import mlflow.utils.autologging_utils
 from mlflow.entities.run_status import RunStatus
 from mlflow.tracking.client import MlflowClient
 from mlflow.utils import gorilla
+from mlflow.utils import is_iterator
 from mlflow.utils.autologging_utils import _logger
 from mlflow.utils.autologging_utils.events import AutologgingEventLogger
 from mlflow.utils.autologging_utils.logging_and_warnings import (
@@ -19,8 +20,7 @@ from mlflow.utils.autologging_utils.logging_and_warnings import (
     set_non_mlflow_warnings_behavior_for_current_thread,
 )
 from mlflow.utils.mlflow_tags import MLFLOW_AUTOLOGGING
-
-_AUTOLOGGING_TEST_MODE_ENV_VAR = "MLFLOW_AUTOLOGGING_TESTING"
+from mlflow.environment_variables import _MLFLOW_AUTOLOGGING_TESTING
 
 _AUTOLOGGING_PATCHES = {}
 
@@ -220,16 +220,14 @@ def with_managed_run(autologging_integration, patch_function, tags=None):
 
         class PatchWithManagedRun(patch_function):
             def __init__(self):
-                super(PatchWithManagedRun, self).__init__()
+                super().__init__()
                 self.managed_run = None
 
             def _patch_implementation(self, original, *args, **kwargs):
                 if not mlflow.active_run():
                     self.managed_run = create_managed_run()
 
-                result = super(PatchWithManagedRun, self)._patch_implementation(
-                    original, *args, **kwargs
-                )
+                result = super()._patch_implementation(original, *args, **kwargs)
 
                 if self.managed_run:
                     mlflow.end_run(RunStatus.to_string(RunStatus.FINISHED))
@@ -239,7 +237,7 @@ def with_managed_run(autologging_integration, patch_function, tags=None):
             def _on_exception(self, e):
                 if self.managed_run:
                     mlflow.end_run(RunStatus.to_string(RunStatus.FAILED))
-                super(PatchWithManagedRun, self)._on_exception(e)
+                super()._on_exception(e)
 
         return PatchWithManagedRun
 
@@ -278,7 +276,7 @@ def is_testing():
         - Disables exception handling for patched function logic, ensuring that patch code
           executes without errors during testing
     """
-    return os.environ.get(_AUTOLOGGING_TEST_MODE_ENV_VAR, "false") == "true"
+    return _MLFLOW_AUTOLOGGING_TESTING.get()
 
 
 def safe_patch(
@@ -330,7 +328,7 @@ def safe_patch(
         destination, function_name, bypass_descriptor_protocol=True
     )
     if original_fn != raw_original_obj:
-        raise RuntimeError(f"Unsupport patch on {str(destination)}.{function_name}")
+        raise RuntimeError(f"Unsupport patch on {destination}.{function_name}")
     elif isinstance(original_fn, property):
         is_property_method = True
 
@@ -402,7 +400,6 @@ def safe_patch(
             reroute_warnings=True,
             disable_warnings=is_silent_mode,
         ):
-
             if is_testing():
                 preexisting_run_for_testing = mlflow.active_run()
 
@@ -500,7 +497,14 @@ def safe_patch(
                     def call_original(*og_args, **og_kwargs):
                         def _original_fn(*_og_args, **_og_kwargs):
                             if is_testing():
-                                _validate_args(args, kwargs, og_args, og_kwargs)
+                                _validate_args(
+                                    autologging_integration,
+                                    function_name,
+                                    args,
+                                    kwargs,
+                                    og_args,
+                                    og_kwargs,
+                                )
                                 # By the time `original` is called by the patch implementation, we
                                 # assume that either: 1. the patch implementation has already
                                 # created an MLflow run or 2. the patch code will not create an
@@ -652,7 +656,7 @@ def revert_patches(autologging_integration):
 
     :param autologging_integration: The name of the autologging integration associated with the
                                     patch. Note: If called via fluent api
-                                    (`autologging_integration="mlfow"`), then revert all patches
+                                    (`autologging_integration="mlflow"`), then revert all patches
                                     for all active autologging integrations.
     """
     for patch in _AUTOLOGGING_PATCHES.get(autologging_integration, []):
@@ -750,7 +754,7 @@ def _store_patch(autologging_integration, patch):
     if autologging_integration in _AUTOLOGGING_PATCHES:
         _AUTOLOGGING_PATCHES[autologging_integration].add(patch)
     else:
-        _AUTOLOGGING_PATCHES[autologging_integration] = set([patch])
+        _AUTOLOGGING_PATCHES[autologging_integration] = {patch}
 
 
 def _validate_autologging_run(autologging_integration, run_id):
@@ -765,16 +769,118 @@ def _validate_autologging_run(autologging_integration, run_id):
     run = client.get_run(run_id)
     autologging_tag_value = run.data.tags.get(MLFLOW_AUTOLOGGING)
     assert autologging_tag_value == autologging_integration, (
-        "Autologging run with id {} failed to set autologging tag with expected value. Expected: "
-        "'{}', Actual: '{}'".format(run_id, autologging_integration, autologging_tag_value)
+        f"Autologging run with id {run_id} failed to set autologging tag with expected value. "
+        f"Expected: '{autologging_integration}', Actual: '{autologging_tag_value}'"
     )
     assert RunStatus.is_terminated(
         RunStatus.from_string(run.info.status)
-    ), "Autologging run with id {} has a non-terminal status '{}'".format(run_id, run.info.status)
+    ), f"Autologging run with id {run_id} has a non-terminal status '{run.info.status}'"
+
+
+class ValidationExemptArgument(typing.NamedTuple):
+    """
+    A NamedTuple representing the properties of an argument that is exempt from validation
+
+    autologging_integration: The name of the autologging integration.
+    function_name: The name of the function that is being validated.
+    type_function: A Callable that accepts an object and returns True if the given object matches
+                   the argument type. Returns False otherwise.
+    positional_argument_index: The index of the argument in the function signature.
+    keyword_argument_name: The name of the argument in the function signature.
+    """
+
+    autologging_integration: str
+    function_name: str
+    type_function: typing.Callable
+    positional_argument_index: int = None
+    keyword_argument_name: str = None
+
+    def matches(
+        self,
+        autologging_integration,
+        function_name,
+        value,
+        argument_index=None,
+        argument_name=None,
+    ):
+        """
+        This method checks if the properties provided through the function arguments matches the
+        properties defined in the NamedTuple.
+
+        :param autologging_integration: The name of an autologging integration.
+        :param function_name: The name of the function that is being matched.
+        :param value: The value of the argument.
+        :param argument_index: The index of the argument, if it is passed as a positional
+                                          argument. Otherwise it is None.
+        :param argument_name: The name of the argument, if it is passed as a keyword
+                                      argument. Otherwise it is None.
+        :return: Returns True if the given function properties matches the exempt argument's
+                 properties. Returns False otherwise.
+        """
+        return (
+            self.autologging_integration == autologging_integration
+            and self.function_name == function_name
+            and (
+                self.positional_argument_index == argument_index
+                or self.keyword_argument_name == argument_name
+            )
+            and self.type_function(value)
+        )
+
+
+# WARNING: Exemptions should NOT be introduced unless absolutely necessary. If deemed necessary,
+#          clear reasons must be provided as comment in addition to thorough integration tests.
+_VALIDATION_EXEMPT_ARGUMENTS = [
+    # When extracting implicitly defined `batch_size` in the case that `x` is a generator or a
+    # generator class, we need to consume and restore the first element back to the generator to
+    # calculate the `batch_size`. This means that:
+    # 1. The type of `x` will become 'generator' regardless if user provided `x` as a generator or a
+    #    custom generator class.
+    # 2. The instance of `x` will be different, since we reconstructed the generator after consuming
+    #    the first element.
+    ValidationExemptArgument("tensorflow", "fit", is_iterator, 1, "x")
+]
+
+
+def _is_arg_exempt_from_validation(
+    autologging_integration,
+    function_name,
+    argument,
+    argument_index=None,
+    argument_name=None,
+):
+    """
+    This function is responsible for determining whether or not an argument is exempt from autolog
+    safety validations. This includes both type checking and immutable checking.
+
+    :param autologging_integration: The name of the autologging integration.
+    :param function_name: The name of the function that is being validated.
+    :param argument: The actual argument.
+    :param argument_index: The index of the argument, if it is passed as a positional
+                                      argument. Otherwise it is None.
+    :param argument_name: The name of the argument, if it is passed as a keyword argument.
+                                  Otherwise it is None.
+    :return: True or False
+    """
+    return any(
+        exemption.matches(
+            autologging_integration,
+            function_name,
+            argument,
+            argument_index,
+            argument_name,
+        )
+        for exemption in _VALIDATION_EXEMPT_ARGUMENTS
+    )
 
 
 def _validate_args(
-    user_call_args, user_call_kwargs, autologging_call_args, autologging_call_kwargs
+    autologging_integration,
+    function_name,
+    user_call_args,
+    user_call_kwargs,
+    autologging_call_args,
+    autologging_call_kwargs,
 ):
     """
     Used for testing purposes to verify that, when a patched ML function calls its underlying
@@ -804,21 +910,37 @@ def _validate_args(
                 _validate_new_input(item)
         elif callable(inp):
             assert getattr(inp, _ATTRIBUTE_EXCEPTION_SAFE, False), (
-                "New function argument '{}' passed to original function is not exception-safe."
+                f"New function argument '{inp}' passed to original function is not exception-safe."
                 " Please decorate the function with `exception_safe_function` or "
                 "`pickalable_exception_safe_function`"
-            ).format(inp)
+            )
         else:
             assert hasattr(inp, "__class__") and type(inp.__class__) in [
                 ExceptionSafeClass,
                 ExceptionSafeAbstractClass,
             ], (
-                "Invalid new input '{}'. New args / kwargs introduced to `original` function "
+                f"Invalid new input '{inp}'. New args / kwargs introduced to `original` function "
                 "calls by patched code must either be functions decorated with "
                 "`exception_safe_function_for_class`, instances of classes with the "
                 "`ExceptionSafeClass` or `ExceptionSafeAbstractClass` metaclass safe or lists of "
-                "such exception safe functions / classes.".format(inp)
+                "such exception safe functions / classes."
             )
+
+    def _assert_autologging_input_positional_args_are_superset(
+        autologging_call_input, user_call_input
+    ):
+        length_diff = len(autologging_call_input) - len(user_call_input)
+        assert (
+            length_diff >= 0
+        ), f"{length_diff} expected inputs are missing from the call to the original function."
+
+    def _assert_autologging_input_kwargs_are_superset(autologging_call_input, user_call_input):
+        assert set(user_call_input.keys()).issubset(set(autologging_call_input.keys())), (
+            "Keyword or dictionary arguments to original function omit"
+            " one or more expected keys: '{}'".format(
+                set(user_call_input.keys()) - set(autologging_call_input.keys())
+            )
+        )
 
     def _validate(autologging_call_input, user_call_input=None):
         """
@@ -833,7 +955,11 @@ def _validate_args(
               be equivalent to `user_call_input` or be a superset of `user_call_input`
             - for all other input types, `autologging_call_input` and `user_call_input`
               must be equivalent by reference equality or by object equality
+
+        :param autologging_call_input: call input from autologging
+        :param user_call_input: call input from user
         """
+
         if user_call_input is None and autologging_call_input is not None:
             _validate_new_input(autologging_call_input)
             return
@@ -845,11 +971,8 @@ def _validate_args(
         )
 
         if type(autologging_call_input) in [list, tuple]:
-            length_difference = len(autologging_call_input) - len(user_call_input)
-            assert (
-                length_difference >= 0
-            ), "{} expected inputs are missing from the call to the original function.".format(
-                length_difference
+            _assert_autologging_input_positional_args_are_superset(
+                autologging_call_input, user_call_input
             )
             # If the autologging call input is longer than the user call input, we `zip_longest`
             # will pad the user call input with `None` values to ensure that the subsequent calls
@@ -857,12 +980,7 @@ def _validate_args(
             for a, u in itertools.zip_longest(autologging_call_input, user_call_input):
                 _validate(a, u)
         elif type(autologging_call_input) == dict:
-            assert set(user_call_input.keys()).issubset(set(autologging_call_input.keys())), (
-                "Keyword or dictionary arguments to original function omit"
-                " one or more expected keys: '{}'".format(
-                    set(user_call_input.keys()) - set(autologging_call_input.keys())
-                )
-            )
+            _assert_autologging_input_kwargs_are_superset(autologging_call_input, user_call_input)
             for key in autologging_call_input.keys():
                 _validate(autologging_call_input[key], user_call_input.get(key, None))
         else:
@@ -871,11 +989,37 @@ def _validate_args(
                 or autologging_call_input == user_call_input
             ), (
                 "Input to original function does not match expected input."
-                " Original: '{}'. Expected: '{}'".format(autologging_call_input, user_call_input)
+                f" Original: '{autologging_call_input}'. Expected: '{user_call_input}'"
             )
 
-    _validate(autologging_call_args, user_call_args)
-    _validate(autologging_call_kwargs, user_call_kwargs)
+    # Similar validation logic found in _validate, unraveling the list of arguments to exclude
+    # checks for any validation exempt positional arguments.
+    _assert_autologging_input_positional_args_are_superset(autologging_call_args, user_call_args)
+    for index, autologging_call_arg, user_call_arg in itertools.zip_longest(
+        range(len(user_call_args)), autologging_call_args, user_call_args
+    ):
+        if not _is_arg_exempt_from_validation(
+            autologging_integration,
+            function_name,
+            user_call_arg,
+            argument_index=index,
+        ):
+            _validate(autologging_call_arg, user_call_arg)
+
+    # Similar validation logic found in _validate, unraveling the dictionary of arguments to exclude
+    # checks for any validation exempt keyword arguments.
+    _assert_autologging_input_kwargs_are_superset(autologging_call_kwargs, user_call_kwargs)
+    for key in autologging_call_kwargs.keys():
+        if not _is_arg_exempt_from_validation(
+            autologging_integration,
+            function_name,
+            user_call_kwargs.get(key, None),
+            argument_name=key,
+        ):
+            _validate(
+                autologging_call_kwargs[key],
+                user_call_kwargs.get(key, None),
+            )
 
 
 __all__ = [

@@ -6,6 +6,7 @@ from mlflow.exceptions import MlflowException
 from mlflow.protos.databricks_pb2 import RESOURCE_DOES_NOT_EXIST, INTERNAL_ERROR
 from mlflow.deployments.base import BaseDeploymentClient
 from mlflow.deployments.utils import parse_target_uri
+from mlflow.utils.annotations import developer_stable
 
 # TODO: refactor to have a common base class for all the plugin implementation in MLFlow
 #   mlflow/tracking/context/registry.py
@@ -13,6 +14,7 @@ from mlflow.deployments.utils import parse_target_uri
 #   mlflow/store/artifact/artifact_repository_registry.py
 
 
+@developer_stable
 class PluginManager(abc.ABC):
     """
     Abstract class defining a entrypoint based plugin registration.
@@ -72,6 +74,7 @@ class PluginManager(abc.ABC):
         self._has_registered = True
 
 
+@developer_stable
 class DeploymentPlugins(PluginManager):
     def __init__(self):
         super().__init__("mlflow.deployments")
@@ -84,11 +87,11 @@ class DeploymentPlugins(PluginManager):
             plugin_like = self.registry[target_name]
         except KeyError:
             msg = (
-                'No plugin found for managing model deployments to "{target}". '
-                'In order to deploy models to "{target}", find and install an appropriate '
+                f'No plugin found for managing model deployments to "{item}". '
+                f'In order to deploy models to "{item}", find and install an appropriate '
                 "plugin from "
                 "https://mlflow.org/docs/latest/plugins.html#community-plugins using "
-                "your package manager (pip, conda etc).".format(target=item)
+                "your package manager (pip, conda etc)."
             )
             raise MlflowException(msg, error_code=RESOURCE_DOES_NOT_EXIST)
 
@@ -96,7 +99,7 @@ class DeploymentPlugins(PluginManager):
             try:
                 plugin_obj = plugin_like.load()
             except (AttributeError, ImportError) as exc:
-                raise RuntimeError('Failed to load the plugin "{}": {}'.format(item, str(exc)))
+                raise RuntimeError(f'Failed to load the plugin "{item}": {exc}')
             self.registry[item] = plugin_obj
         else:
             plugin_obj = plugin_like
@@ -115,23 +118,23 @@ class DeploymentPlugins(PluginManager):
                 deployment_classes.append(name)
         if len(expected) > 0:
             raise MlflowException(
-                "Plugin registered for the target {} does not has all "
+                f"Plugin registered for the target {item} does not have all "
                 "the required interfaces. Raise an issue with the "
                 "plugin developers.\n"
-                "Missing interfaces: {}".format(item, expected),
+                f"Missing interfaces: {expected}",
                 error_code=INTERNAL_ERROR,
             )
         if len(deployment_classes) > 1:
             raise MlflowException(
-                "Plugin registered for the target {} has more than one "
+                f"Plugin registered for the target {item} has more than one "
                 "child class of BaseDeploymentClient. Raise an issue with"
                 " the plugin developers. "
-                "Classes found are {}".format(item, deployment_classes)
+                f"Classes found are {deployment_classes}"
             )
         elif len(deployment_classes) == 0:
             raise MlflowException(
-                "Plugin registered for the target {} has no child class"
+                f"Plugin registered for the target {item} has no child class"
                 " of BaseDeploymentClient. Raise an issue with the "
-                "plugin developers".format(item)
+                "plugin developers"
             )
         return plugin_obj

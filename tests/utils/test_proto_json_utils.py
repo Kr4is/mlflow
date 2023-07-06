@@ -1,26 +1,31 @@
 import base64
 import json
+import datetime
+
+import pytest
+
 import numpy as np
 import pandas as pd
-import pytest
+from google.protobuf.text_format import Parse as ParseTextIntoProto
 
 from mlflow.entities import Experiment, Metric
 from mlflow.entities.model_registry import RegisteredModel, ModelVersion
 from mlflow.exceptions import MlflowException
 from mlflow.protos.service_pb2 import Experiment as ProtoExperiment
 from mlflow.protos.service_pb2 import Metric as ProtoMetric
-from mlflow.types import Schema, TensorSpec, ColSpec
 from mlflow.protos.model_registry_pb2 import RegisteredModel as ProtoRegisteredModel
-from tests.protos.test_message_pb2 import TestMessage
-from google.protobuf.text_format import Parse as ParseTextIntoProto
-
+from mlflow.types import Schema, TensorSpec, ColSpec
 from mlflow.utils.proto_json_utils import (
+    cast_df_types_according_to_schema,
     message_to_json,
     parse_dict,
     _stringify_all_experiment_ids,
     parse_tf_serving_input,
-    _dataframe_from_json,
+    dataframe_from_raw_json,
+    _CustomJsonEncoder,
+    MlflowFailedTypeConversion,
 )
+from tests.protos.test_message_pb2 import TestMessage
 
 # Prevent pytest from trying to collect TestMessage as a test class:
 TestMessage.__test__ = False
@@ -248,13 +253,14 @@ def test_back_compat():
     assert exp_json == in_json
 
 
-def test_parse_tf_serving_dictionary():
-    def assert_result(result, expected_result):
-        assert result.keys() == expected_result.keys()
-        for key in result:
-            assert (result[key] == expected_result[key]).all()
-            assert result[key].dtype == expected_result[key].dtype
+def assert_result(result, expected_result):
+    assert result.keys() == expected_result.keys()
+    for key in result:
+        assert (result[key] == expected_result[key]).all()
+        assert result[key].dtype == expected_result[key].dtype
 
+
+def test_parse_tf_serving_dictionary():
     # instances are correctly aggregated to dict of input name -> tensor
     tfserving_input = {
         "instances": [
@@ -280,7 +286,7 @@ def test_parse_tf_serving_dictionary():
             TensorSpec(np.dtype("int32"), [-1], "c"),
         ]
     )
-    dfSchema = Schema([ColSpec("string", "a"), ColSpec("float", "b"), ColSpec("integer", "c")])
+    df_schema = Schema([ColSpec("string", "a"), ColSpec("float", "b"), ColSpec("integer", "c")])
     result = parse_tf_serving_input(tfserving_input, schema)
     expected_result_schema = {
         "a": np.array(["s1", "s2", "s3"], dtype=np.dtype("str")),
@@ -289,7 +295,7 @@ def test_parse_tf_serving_dictionary():
     }
     assert_result(result, expected_result_schema)
     # With df Schema
-    result = parse_tf_serving_input(tfserving_input, dfSchema)
+    result = parse_tf_serving_input(tfserving_input, df_schema)
     assert_result(result, expected_result_schema)
 
     # input provided as a dict
@@ -309,8 +315,52 @@ def test_parse_tf_serving_dictionary():
     assert_result(result, expected_result_schema)
 
     # With df Schema
-    result = parse_tf_serving_input(tfserving_input, dfSchema)
+    result = parse_tf_serving_input(tfserving_input, df_schema)
     assert_result(result, expected_result_schema)
+
+
+def test_parse_tf_serving_arbitrary_input_dictionary():
+    # input provided as a columnar dict with an arbitrary shape for each input, specifically a
+    # different 0th dimension.
+    tfserving_input_arbitrary = {
+        "inputs": {
+            "a": [["s1", "s2", "s3"], ["s4", "s5", "s6"]],  # [2, 3]
+            "b": [1.1, 2.2, 3.3],  # [3,  ]
+            "c": [[1, 2, 3], [4, 5, 6], [7, 8, 9], [10, 11, 12], [13, 14, 15]],  # [4, 3]
+        }
+    }
+
+    schema = Schema(
+        [
+            TensorSpec(np.dtype("str"), [-1, 3], "a"),
+            TensorSpec(np.dtype("float32"), [-1], "b"),
+            TensorSpec(np.dtype("int32"), [-1, 4], "c"),
+        ]
+    )
+    df_schema = Schema([ColSpec("string", "a"), ColSpec("float", "b"), ColSpec("integer", "c")])
+
+    expected_result_no_schema_arbitrary = {
+        "a": np.array([["s1", "s2", "s3"], ["s4", "s5", "s6"]]),
+        "b": np.array([1.1, 2.2, 3.3]),
+        "c": np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9], [10, 11, 12], [13, 14, 15]]),
+    }
+    expected_result_schema_arbitrary = {
+        "a": np.array([["s1", "s2", "s3"], ["s4", "s5", "s6"]], dtype=np.dtype("str")),
+        "b": np.array([1.1, 2.2, 3.3], dtype="float32"),
+        "c": np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9], [10, 11, 12], [13, 14, 15]], dtype="int32"),
+    }
+
+    # Without Schema
+    result = parse_tf_serving_input(tfserving_input_arbitrary)
+    assert_result(result, expected_result_no_schema_arbitrary)
+
+    # With Schema
+    result = parse_tf_serving_input(tfserving_input_arbitrary, schema)
+    assert_result(result, expected_result_schema_arbitrary)
+
+    # With df Schema
+    result = parse_tf_serving_input(tfserving_input_arbitrary, df_schema)
+    assert_result(result, expected_result_schema_arbitrary)
 
 
 def test_parse_tf_serving_single_array():
@@ -368,14 +418,6 @@ def test_parse_tf_serving_raises_expected_errors():
         MlflowException, match="The length of values for each input/column name are not the same"
     ):
         parse_tf_serving_input(tfserving_instances)
-
-    tfserving_inputs = {
-        "inputs": {"a": ["s1", "s2", "s3"], "b": [1, 2, 3], "c": [[1, 2, 3], [4, 5, 6]]}
-    }
-    with pytest.raises(
-        MlflowException, match="The length of values for each input/column name are not the same"
-    ):
-        parse_tf_serving_input(tfserving_inputs)
 
     # cannot specify both instance and inputs
     tfserving_input = {
@@ -437,14 +479,14 @@ def test_dataframe_from_json():
             ColSpec("string", "date_string"),
         ]
     )
-    parsed = _dataframe_from_json(
+    parsed = dataframe_from_raw_json(
         jsonable_df.to_json(orient="split"), pandas_orient="split", schema=schema
     )
-    assert parsed.equals(source)
-    parsed = _dataframe_from_json(
+    pd.testing.assert_frame_equal(parsed, source)
+    parsed = dataframe_from_raw_json(
         jsonable_df.to_json(orient="records"), pandas_orient="records", schema=schema
     )
-    assert parsed.equals(source)
+    pd.testing.assert_frame_equal(parsed, source)
     # try parsing with tensor schema
     tensor_schema = Schema(
         [
@@ -457,20 +499,20 @@ def test_dataframe_from_json():
             TensorSpec(np.dtype(bytes), [-1], "binary"),
         ]
     )
-    parsed = _dataframe_from_json(
+    parsed = dataframe_from_raw_json(
         jsonable_df.to_json(orient="split"), pandas_orient="split", schema=tensor_schema
     )
 
     # NB: tensor schema does not automatically decode base64 encoded bytes.
-    assert parsed.equals(jsonable_df)
-    parsed = _dataframe_from_json(
+    pd.testing.assert_frame_equal(parsed, jsonable_df)
+    parsed = dataframe_from_raw_json(
         jsonable_df.to_json(orient="records"), pandas_orient="records", schema=tensor_schema
     )
 
     # NB: tensor schema does not automatically decode base64 encoded bytes.
-    assert parsed.equals(jsonable_df)
+    pd.testing.assert_frame_equal(parsed, jsonable_df)
 
-    # Test parse with TesnorSchema with a single tensor
+    # Test parse with TensorSchema with a single tensor
     tensor_schema = Schema([TensorSpec(np.dtype("float32"), [-1, 3])])
     source = pd.DataFrame(
         {
@@ -480,13 +522,100 @@ def test_dataframe_from_json():
         },
         columns=["a", "b", "c"],
     )
-    assert source.equals(
-        _dataframe_from_json(
+    pd.testing.assert_frame_equal(
+        source,
+        dataframe_from_raw_json(
             source.to_json(orient="split"), pandas_orient="split", schema=tensor_schema
-        )
+        ),
     )
-    assert source.equals(
-        _dataframe_from_json(
+    pd.testing.assert_frame_equal(
+        source,
+        dataframe_from_raw_json(
             source.to_json(orient="records"), pandas_orient="records", schema=tensor_schema
-        )
+        ),
     )
+
+    schema = Schema([ColSpec("datetime", "datetime")])
+    parsed = dataframe_from_raw_json(
+        """
+[
+    {"datetime": "2022-01-01T00:00:00"},
+    {"datetime": "2022-01-02T03:04:05"}
+]
+    """,
+        pandas_orient="records",
+        schema=schema,
+    )
+    expected = pd.DataFrame(
+        {
+            "datetime": [
+                pd.Timestamp("2022-01-01T00:00:00"),
+                pd.Timestamp("2022-01-02T03:04:05"),
+            ]
+        },
+    )
+    pd.testing.assert_frame_equal(parsed, expected)
+
+
+@pytest.mark.parametrize(
+    ("dt", "expected"),
+    [
+        (datetime.datetime(2022, 1, 1), '"2022-01-01T00:00:00"'),
+        (datetime.datetime(2022, 1, 2, 3, 4, 5), '"2022-01-02T03:04:05"'),
+        (datetime.date(2022, 1, 1), '"2022-01-01"'),
+        (datetime.time(0, 0, 0), '"00:00:00"'),
+        (pd.Timestamp(2022, 1, 1), '"2022-01-01T00:00:00"'),
+    ],
+)
+def test_datetime_encoder(dt, expected):
+    assert json.dumps(dt, cls=_CustomJsonEncoder) == expected
+
+
+@pytest.mark.parametrize(
+    ("dataframe", "schema", "expected"),
+    [
+        (
+            pd.DataFrame(columns=["foo"], data=[1, 2, 3]),
+            Schema([TensorSpec(np.dtype("float64"), [-1], "foo")]),
+            np.dtype("float64"),
+        ),
+        (
+            pd.DataFrame(columns=["foo"], data=[[[1, 2, 3]], [[4, 5, 6]]]),
+            Schema([TensorSpec(np.dtype("float64"), [-1, 1], "foo")]),
+            np.dtype("object"),
+        ),
+        (
+            pd.DataFrame(index=[1, 2, 3], columns=["foo"], data=[1, 2, 3]),
+            Schema([TensorSpec(np.dtype("float64"), [-1], "foo")]),
+            np.dtype("float64"),
+        ),
+        (
+            pd.DataFrame(columns=["foo"], data=[1, 2, 3]),
+            Schema([ColSpec("double", "foo")]),
+            np.dtype("float64"),
+        ),
+    ],
+)
+def test_cast_df_types_according_to_schema_success(dataframe, schema, expected):
+    casted_pdf = cast_df_types_according_to_schema(dataframe, schema)
+    assert casted_pdf["foo"].dtype == expected
+
+
+@pytest.mark.parametrize(
+    ("dataframe", "schema", "error_message"),
+    [
+        (
+            pd.DataFrame(columns=["foo"], data=[1, 2, 3]),
+            Schema([ColSpec("binary", "foo")]),
+            r"TypeError\('encoding without a string argument'\)",
+        ),
+        (
+            pd.DataFrame(columns=["foo"], data=["a", "b", "c"]),
+            Schema([ColSpec("double", "foo")]),
+            r'ValueError\("could not convert string to float: \'a\'"\)',
+        ),
+    ],
+)
+def test_cast_df_types_according_to_schema_error_message(dataframe, schema, error_message):
+    with pytest.raises(MlflowFailedTypeConversion, match=error_message):
+        cast_df_types_according_to_schema(dataframe, schema)

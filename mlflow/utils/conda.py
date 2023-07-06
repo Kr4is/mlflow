@@ -3,9 +3,11 @@ import json
 import logging
 import os
 
+import yaml
+
 from mlflow.exceptions import ExecutionException
 from mlflow.utils import process
-
+from mlflow.utils.environment import Environment
 
 # Environment variable indicating a path to a conda installation. MLflow will default to running
 # "conda" if unset
@@ -26,18 +28,16 @@ def get_conda_command(conda_env_name):
     #  Checking for newer conda versions
     if os.name != "nt" and ("CONDA_EXE" in os.environ or "MLFLOW_CONDA_HOME" in os.environ):
         conda_path = get_conda_bin_executable("conda")
-        activate_conda_env = [
-            "source {}/../etc/profile.d/conda.sh".format(os.path.dirname(conda_path))
-        ]
-        activate_conda_env += ["conda activate {} 1>&2".format(conda_env_name)]
+        activate_conda_env = [f"source {os.path.dirname(conda_path)}/../etc/profile.d/conda.sh"]
+        activate_conda_env += [f"conda activate {conda_env_name} 1>&2"]
     else:
         activate_path = get_conda_bin_executable("activate")
         # in case os name is not 'nt', we are not running on windows. It introduces
         # bash command otherwise.
         if os.name != "nt":
-            return ["source %s %s 1>&2" % (activate_path, conda_env_name)]
+            return [f"source {activate_path} {conda_env_name} 1>&2"]
         else:
-            return ["conda activate %s" % (conda_env_name)]
+            return [f"conda activate {conda_env_name}"]
     return activate_conda_env
 
 
@@ -114,6 +114,75 @@ _CONDA_CACHE_PKGS_DIR = "conda_cache_pkgs"
 _PIP_CACHE_DIR = "pip_cache_pkgs"
 
 
+def _create_conda_env(
+    conda_env_path,
+    conda_env_create_path,
+    project_env_name,
+    conda_extra_env_vars,
+    capture_output,
+):
+    if conda_env_path:
+        process._exec_cmd(
+            [
+                conda_env_create_path,
+                "env",
+                "create",
+                "-n",
+                project_env_name,
+                "--file",
+                conda_env_path,
+                "--quiet",
+            ],
+            extra_env=conda_extra_env_vars,
+            capture_output=capture_output,
+        )
+    else:
+        process._exec_cmd(
+            [
+                conda_env_create_path,
+                "create",
+                "--channel",
+                "conda-forge",
+                "--yes",
+                "--override-channels",
+                "-n",
+                project_env_name,
+                "python",
+            ],
+            extra_env=conda_extra_env_vars,
+            capture_output=capture_output,
+        )
+
+    return Environment(get_conda_command(project_env_name), conda_extra_env_vars)
+
+
+def _create_conda_env_retry(
+    conda_env_path, conda_env_create_path, project_env_name, conda_extra_env_vars, _capture_output
+):
+    """
+    `conda env create` command can fail due to network issues such as `ConnectionResetError`
+    while collecting package metadata. This function retries the command up to 3 times.
+    """
+    num_attempts = 3
+    for attempt in range(num_attempts):
+        try:
+            return _create_conda_env(
+                conda_env_path,
+                conda_env_create_path,
+                project_env_name,
+                conda_extra_env_vars,
+                capture_output=True,
+            )
+        except process.ShellCommandException as e:
+            error_str = str(e)
+            if (num_attempts - attempt - 1) > 0 and (
+                "ConnectionResetError" in error_str or "ChunkedEncodingError" in error_str
+            ):
+                _logger.warning("Conda env creation failed due to network issue. Retrying...")
+                continue
+            raise
+
+
 def _get_conda_extra_env_vars(env_root_dir=None):
     """
     Given the `env_root_dir` (See doc of PyFuncBackend constructor argument `env_root_dir`),
@@ -142,7 +211,7 @@ def _get_conda_extra_env_vars(env_root_dir=None):
         "CONDA_ENVS_PATH": conda_envs_path,
         "CONDA_PKGS_DIRS": conda_pkgs_path,
         "PIP_CACHE_DIR": pip_cache_dir,
-        # PIP_NO_INPUT=1 make pip run in non-interactive mode,
+        # PIP_NO_INPUT=1 makes pip run in non-interactive mode,
         # otherwise pip might prompt "yes or no" and ask stdin input
         "PIP_NO_INPUT": "1",
     }
@@ -167,30 +236,29 @@ def get_or_create_conda_env(conda_env_path, env_id=None, capture_output=False, e
     conda_env_create_path = _get_conda_executable_for_create_env()
 
     try:
+        # Checks if Conda executable exists
         process._exec_cmd([conda_path, "--help"], throw_on_error=False)
-    except EnvironmentError:
+    except OSError:
         raise ExecutionException(
-            "Could not find Conda executable at {0}. "
+            f"Could not find Conda executable at {conda_path}. "
             "Ensure Conda is installed as per the instructions at "
             "https://conda.io/projects/conda/en/latest/"
             "user-guide/install/index.html. "
             "You can also configure MLflow to look for a specific "
-            "Conda executable by setting the {1} environment variable "
-            "to the path of the Conda executable".format(conda_path, MLFLOW_CONDA_HOME)
+            f"Conda executable by setting the {MLFLOW_CONDA_HOME} environment variable "
+            "to the path of the Conda executable"
         )
 
     try:
+        # Checks if executable for environment creation exists
         process._exec_cmd([conda_env_create_path, "--help"], throw_on_error=False)
-    except EnvironmentError:
+    except OSError:
         raise ExecutionException(
-            "You have set the env variable {0}, but {1} does not exist or "
-            "it is not working properly. Note that {1} and the conda executable need to be "
+            f"You have set the env variable {MLFLOW_CONDA_CREATE_ENV_CMD}, but "
+            f"{conda_env_create_path} does not exist or it is not working properly. "
+            f"Note that {conda_env_create_path} and the conda executable need to be "
             "in the same conda environment. You can change the search path by"
-            "modifying the env variable {2}".format(
-                MLFLOW_CONDA_CREATE_ENV_CMD,
-                conda_env_create_path,
-                MLFLOW_CONDA_HOME,
-            )
+            f"modifying the env variable {MLFLOW_CONDA_HOME}"
         )
 
     conda_extra_env_vars = _get_conda_extra_env_vars(env_root_dir)
@@ -205,41 +273,23 @@ def get_or_create_conda_env(conda_env_path, env_id=None, capture_output=False, e
 
     if project_env_name in _list_conda_environments(conda_extra_env_vars):
         _logger.info("Conda environment %s already exists.", project_env_path)
-        return project_env_name
+        return Environment(get_conda_command(project_env_name), conda_extra_env_vars)
 
     _logger.info("=== Creating conda environment %s ===", project_env_path)
     try:
-        if conda_env_path:
-            process._exec_cmd(
-                [
-                    conda_env_create_path,
-                    "env",
-                    "create",
-                    "-n",
-                    project_env_name,
-                    "--file",
-                    conda_env_path,
-                ],
-                extra_env=conda_extra_env_vars,
-                capture_output=capture_output,
-            )
-        else:
-            process._exec_cmd(
-                [
-                    conda_env_create_path,
-                    "create",
-                    "--channel",
-                    "conda-forge",
-                    "--yes",
-                    "--override-channels",
-                    "-n",
-                    project_env_name,
-                    "python",
-                ],
-                extra_env=conda_extra_env_vars,
-                capture_output=capture_output,
-            )
-        return project_env_name
+        _create_conda_env_func = (
+            # Retry conda env creation in a pytest session to avoid flaky test failures
+            _create_conda_env_retry
+            if "PYTEST_CURRENT_TEST" in os.environ
+            else _create_conda_env
+        )
+        return _create_conda_env_func(
+            conda_env_path,
+            conda_env_create_path,
+            project_env_name,
+            conda_extra_env_vars,
+            capture_output,
+        )
     except Exception:
         try:
             if project_env_name in _list_conda_environments(conda_extra_env_vars):
@@ -267,3 +317,14 @@ def get_or_create_conda_env(conda_env_path, env_id=None, capture_output=False, e
                 repr(e),
             )
         raise
+
+
+def _get_conda_dependencies(conda_yaml_path):
+    """
+    Extracts conda dependencies from a conda yaml file.
+
+    :param conda_yaml_path: Conda yaml file path.
+    """
+    with open(conda_yaml_path) as f:
+        conda_yaml = yaml.safe_load(f)
+        return [d for d in conda_yaml.get("dependencies", []) if isinstance(d, str)]

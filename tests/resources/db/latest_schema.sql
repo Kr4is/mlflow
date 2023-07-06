@@ -10,9 +10,29 @@ CREATE TABLE experiments (
 	name VARCHAR(256) NOT NULL,
 	artifact_location VARCHAR(256),
 	lifecycle_stage VARCHAR(32),
+	creation_time BIGINT,
+	last_update_time BIGINT,
 	CONSTRAINT experiment_pk PRIMARY KEY (experiment_id),
 	UNIQUE (name),
 	CONSTRAINT experiments_lifecycle_stage CHECK (lifecycle_stage IN ('active', 'deleted'))
+)
+
+
+CREATE TABLE input_tags (
+	input_uuid VARCHAR(36) NOT NULL,
+	name VARCHAR(255) NOT NULL,
+	value VARCHAR(500) NOT NULL,
+	CONSTRAINT input_tags_pk PRIMARY KEY (input_uuid, name)
+)
+
+
+CREATE TABLE inputs (
+	input_uuid VARCHAR(36) NOT NULL,
+	source_type VARCHAR(36) NOT NULL,
+	source_id VARCHAR(36) NOT NULL,
+	destination_type VARCHAR(36) NOT NULL,
+	destination_id VARCHAR(36) NOT NULL,
+	CONSTRAINT inputs_pk PRIMARY KEY (source_type, source_id, destination_type, destination_id)
 )
 
 
@@ -23,6 +43,20 @@ CREATE TABLE registered_models (
 	description VARCHAR(5000),
 	CONSTRAINT registered_model_pk PRIMARY KEY (name),
 	UNIQUE (name)
+)
+
+
+CREATE TABLE datasets (
+	dataset_uuid VARCHAR(36) NOT NULL,
+	experiment_id INTEGER NOT NULL,
+	name VARCHAR(500) NOT NULL,
+	digest VARCHAR(36) NOT NULL,
+	dataset_source_type VARCHAR(36) NOT NULL,
+	dataset_source TEXT NOT NULL,
+	dataset_schema TEXT,
+	dataset_profile TEXT,
+	CONSTRAINT dataset_pk PRIMARY KEY (experiment_id, name, digest),
+	FOREIGN KEY(experiment_id) REFERENCES experiments (experiment_id)
 )
 
 
@@ -53,6 +87,15 @@ CREATE TABLE model_versions (
 )
 
 
+CREATE TABLE registered_model_aliases (
+	name VARCHAR(256) NOT NULL,
+	alias VARCHAR(256) NOT NULL,
+	version INTEGER NOT NULL,
+	CONSTRAINT registered_model_alias_pk PRIMARY KEY (name, alias),
+	CONSTRAINT registered_model_alias_name_fkey FOREIGN KEY(name) REFERENCES registered_models (name) ON DELETE CASCADE ON UPDATE CASCADE
+)
+
+
 CREATE TABLE registered_model_tags (
 	key VARCHAR(250) NOT NULL,
 	value VARCHAR(5000),
@@ -76,6 +119,7 @@ CREATE TABLE runs (
 	lifecycle_stage VARCHAR(20),
 	artifact_uri VARCHAR(200),
 	experiment_id INTEGER,
+	deleted_time BIGINT,
 	CONSTRAINT run_pk PRIMARY KEY (run_uuid),
 	FOREIGN KEY(experiment_id) REFERENCES experiments (experiment_id),
 	CONSTRAINT source_type CHECK (source_type IN ('NOTEBOOK', 'JOB', 'LOCAL', 'UNKNOWN', 'PROJECT')),
@@ -122,7 +166,7 @@ CREATE TABLE model_version_tags (
 
 CREATE TABLE params (
 	key VARCHAR(250) NOT NULL,
-	value VARCHAR(250) NOT NULL,
+	value VARCHAR(500) NOT NULL,
 	run_uuid VARCHAR(32) NOT NULL,
 	CONSTRAINT param_pk PRIMARY KEY (key, run_uuid),
 	FOREIGN KEY(run_uuid) REFERENCES runs (run_uuid)
